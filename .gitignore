@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Nyra runtime data (personal, sensitive)
+data/
+!data/.gitkeep
+
+# Test / temp files
+test.mp3
+test_tts.py
+*.log
+
+# PyInstaller
+*.spec.bak
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# cloudflared binary (downloaded at runtime)
+cloudflared.exe
