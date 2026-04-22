@@ -27,6 +27,7 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 WizardSmallImageFile=assets\nyra_wizard.bmp
+WizardImageFile=compiler:WizModernImage.bmp
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayIcon={app}\{#MyAppExeName}
