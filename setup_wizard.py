@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QProgressBar,
     QPushButton,
     QSizePolicy,
@@ -26,13 +27,13 @@ import hardware as hw
 SETUP_DONE = DATA_DIR / "setup_done"
 USER_CONFIG = DATA_DIR / "user_config.json"
 
-_BG = "#0a0c14"
-_PANEL = "#111520"
+_BG     = "#0a0c14"
+_PANEL  = "#111520"
 _ACCENT = "#4fc3f7"
-_GREEN = "#4caf50"
-_RED = "#ef5350"
-_TEXT = "#e0e8f0"
-_DIM = "#5a6a7a"
+_GREEN  = "#4caf50"
+_RED    = "#ef5350"
+_TEXT   = "#e0e8f0"
+_DIM    = "#5a6a7a"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -50,13 +51,9 @@ def _style_btn(btn: QPushButton, color: str = _ACCENT) -> None:
             border-radius: 6px;
             padding: 0 24px;
         }}
-        QPushButton:hover {{
-            background: {color}44;
-        }}
+        QPushButton:hover {{ background: {color}44; }}
         QPushButton:disabled {{
-            color: {_DIM};
-            border-color: {_DIM};
-            background: transparent;
+            color: {_DIM}; border-color: {_DIM}; background: transparent;
         }}
         """
     )
@@ -80,11 +77,11 @@ def _hline() -> QFrame:
     return line
 
 
-# ── Background worker: ollama pull ───────────────────────────────────────────
+# ── Background workers ────────────────────────────────────────────────────────
 
 class PullThread(QThread):
-    progress = Signal(str)   # log line
-    done = Signal(bool)      # success
+    progress = Signal(str)
+    done = Signal(bool)
 
     def __init__(self, model: str) -> None:
         super().__init__()
@@ -111,28 +108,65 @@ class PullThread(QThread):
             self.done.emit(False)
 
 
+class GroqTestThread(QThread):
+    result = Signal(bool, str)   # ok, message
+
+    def __init__(self, api_key: str) -> None:
+        super().__init__()
+        self._key = api_key
+
+    def run(self) -> None:
+        try:
+            import urllib.request
+            import json as _json
+            body = _json.dumps({
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 4,
+            }).encode()
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/chat/completions",
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {self._key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            self.result.emit(True, "API key verified.")
+        except Exception as exc:
+            msg = str(exc)
+            if "401" in msg or "invalid_api_key" in msg.lower():
+                self.result.emit(False, "Invalid API key.")
+            elif "403" in msg:
+                self.result.emit(False, "Key has no permissions.")
+            else:
+                self.result.emit(False, f"Connection error: {msg[:80]}")
+
+
 # ── Main wizard window ────────────────────────────────────────────────────────
 
 class SetupWizard(QWidget):
     finished = Signal()
-    _detected = Signal(object, object)   # (HardwareProfile, ModelRecommendation)
+    _detected = Signal(object, object)
     _detect_failed = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Nyra — First-Time Setup")
-        self.setFixedSize(680, 560)
+        self.setFixedSize(700, 600)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self._apply_palette()
         self._profile: hw.HardwareProfile | None = None
         self._rec: hw.ModelRecommendation | None = None
         self._pull_thread: PullThread | None = None
+        self._groq_thread: GroqTestThread | None = None
+        self._groq_verified = False
         self._detected.connect(self._on_detected)
         self._detect_failed.connect(self._on_detect_error)
         self._build_ui()
         self._start_detect()
-
-    # ── Palette / theme ───────────────────────────────────────────────────────
 
     def _apply_palette(self) -> None:
         pal = QPalette()
@@ -150,7 +184,7 @@ class SetupWizard(QWidget):
         root.setContentsMargins(40, 32, 40, 32)
         root.setSpacing(0)
 
-        # Title bar
+        # Title
         title_row = QHBoxLayout()
         title = _label("NYRA  SETUP", 18, _ACCENT, bold=True)
         title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -162,12 +196,11 @@ class SetupWizard(QWidget):
         root.addLayout(title_row)
         root.addSpacing(8)
         root.addWidget(_hline())
-        root.addSpacing(20)
+        root.addSpacing(18)
 
-        # ── Step 1: Hardware ──────────────────────────────────────────────────
+        # Step 1 — Hardware
         root.addWidget(_label("SYSTEM ANALYSIS", 9, _DIM, bold=True))
-        root.addSpacing(10)
-
+        root.addSpacing(8)
         self._hw_panel = self._make_panel()
         hw_layout = QVBoxLayout(self._hw_panel)
         hw_layout.setContentsMargins(16, 12, 16, 12)
@@ -175,12 +208,11 @@ class SetupWizard(QWidget):
         self._hw_status = _label("Scanning hardware…", 11, _DIM)
         hw_layout.addWidget(self._hw_status)
         root.addWidget(self._hw_panel)
-        root.addSpacing(20)
+        root.addSpacing(16)
 
-        # ── Step 2: Recommendation ────────────────────────────────────────────
+        # Step 2 — Recommendation
         root.addWidget(_label("RECOMMENDED CONFIGURATION", 9, _DIM, bold=True))
-        root.addSpacing(10)
-
+        root.addSpacing(8)
         self._rec_panel = self._make_panel()
         rec_layout = QVBoxLayout(self._rec_panel)
         rec_layout.setContentsMargins(16, 12, 16, 12)
@@ -188,36 +220,79 @@ class SetupWizard(QWidget):
         self._rec_status = _label("Waiting for hardware scan…", 11, _DIM)
         rec_layout.addWidget(self._rec_status)
         root.addWidget(self._rec_panel)
-        root.addSpacing(20)
+        root.addSpacing(16)
 
-        # ── Step 3: Progress log ──────────────────────────────────────────────
-        root.addWidget(_label("DOWNLOAD LOG", 9, _DIM, bold=True))
-        root.addSpacing(6)
+        # Step 3 — API key (hidden until needed)
+        self._api_section = QWidget()
+        self._api_section.setVisible(False)
+        api_outer = QVBoxLayout(self._api_section)
+        api_outer.setContentsMargins(0, 0, 0, 0)
+        api_outer.setSpacing(8)
+        api_outer.addWidget(_label("GROQ API KEY", 9, _DIM, bold=True))
+        api_panel = self._make_panel()
+        api_inner = QVBoxLayout(api_panel)
+        api_inner.setContentsMargins(16, 14, 16, 14)
+        api_inner.setSpacing(10)
+        api_inner.addWidget(_label(
+            "Nyra uses Groq's free API for AI responses. Get a free key at console.groq.com",
+            10, _DIM
+        ))
+        key_row = QHBoxLayout()
+        self._key_input = QLineEdit()
+        self._key_input.setPlaceholderText("Paste your Groq API key here…")
+        self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key_input.setFixedHeight(38)
+        self._key_input.setFont(QFont("Segoe UI", 10))
+        self._key_input.setStyleSheet(
+            f"background: {_BG}; color: {_TEXT}; border: 1px solid {_DIM}66; "
+            "border-radius: 6px; padding: 0 12px;"
+        )
+        self._key_input.textChanged.connect(self._on_key_changed)
+        self._btn_test = QPushButton("Test")
+        _style_btn(self._btn_test, _ACCENT)
+        self._btn_test.setFixedWidth(80)
+        self._btn_test.setEnabled(False)
+        self._btn_test.clicked.connect(self._test_groq_key)
+        key_row.addWidget(self._key_input)
+        key_row.addWidget(self._btn_test)
+        api_inner.addLayout(key_row)
+        self._key_status = _label("", 10, _DIM)
+        api_inner.addWidget(self._key_status)
+        api_outer.addWidget(api_panel)
+        root.addWidget(self._api_section)
+        root.addSpacing(16)
+
+        # Step 4 — Log (Ollama)
+        self._log_section = QWidget()
+        log_outer = QVBoxLayout(self._log_section)
+        log_outer.setContentsMargins(0, 0, 0, 0)
+        log_outer.setSpacing(6)
+        log_outer.addWidget(_label("DOWNLOAD LOG", 9, _DIM, bold=True))
         self._log = _label("", 9, _DIM)
         self._log.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self._log.setFixedHeight(48)
+        self._log.setFixedHeight(40)
         self._log.setStyleSheet(
             f"color: {_DIM}; background: {_PANEL}; border: 1px solid {_DIM}33; "
             "border-radius: 4px; padding: 6px 10px;"
         )
-        root.addWidget(self._log)
-        root.addSpacing(6)
+        log_outer.addWidget(self._log)
         self._bar = QProgressBar()
-        self._bar.setRange(0, 0)   # indeterminate
+        self._bar.setRange(0, 0)
         self._bar.setFixedHeight(4)
         self._bar.setVisible(False)
         self._bar.setStyleSheet(
             f"QProgressBar {{ background: {_PANEL}; border: none; border-radius: 2px; }}"
             f"QProgressBar::chunk {{ background: {_ACCENT}; border-radius: 2px; }}"
         )
-        root.addWidget(self._bar)
+        log_outer.addWidget(self._bar)
+        root.addWidget(self._log_section)
         root.addStretch()
 
-        # ── Buttons ───────────────────────────────────────────────────────────
+        # Buttons
         root.addWidget(_hline())
-        root.addSpacing(16)
-
+        root.addSpacing(14)
         btn_row = QHBoxLayout()
+
         self._btn_skip = QPushButton("Skip Setup")
         _style_btn(self._btn_skip, _DIM)
         self._btn_skip.clicked.connect(self._skip)
@@ -226,6 +301,11 @@ class SetupWizard(QWidget):
         _style_btn(self._btn_install, _RED)
         self._btn_install.setVisible(False)
         self._btn_install.clicked.connect(self._open_ollama_site)
+
+        self._btn_groq_link = QPushButton("Get Free API Key  ↗")
+        _style_btn(self._btn_groq_link, _ACCENT)
+        self._btn_groq_link.setVisible(False)
+        self._btn_groq_link.clicked.connect(self._open_groq_site)
 
         self._btn_pull = QPushButton("Download Model")
         _style_btn(self._btn_pull, _ACCENT)
@@ -240,7 +320,9 @@ class SetupWizard(QWidget):
         btn_row.addWidget(self._btn_skip)
         btn_row.addStretch()
         btn_row.addWidget(self._btn_install)
-        btn_row.addSpacing(10)
+        btn_row.addSpacing(8)
+        btn_row.addWidget(self._btn_groq_link)
+        btn_row.addSpacing(8)
         btn_row.addWidget(self._btn_pull)
         btn_row.addWidget(self._btn_launch)
         root.addLayout(btn_row)
@@ -274,23 +356,21 @@ class SetupWizard(QWidget):
 
     def _on_detect_error(self, msg: str) -> None:
         self._hw_status.setText(f"Detection failed: {msg}")
-        self._hw_status.setStyleSheet(f"color: {_RED};")
+        self._hw_status.setStyleSheet(f"color: {_RED}; background: transparent;")
 
     def _show_hardware(self, p: hw.HardwareProfile) -> None:
-        layout = self._hw_panel.layout()
         self._hw_status.setText(
             f"CPU  {p.cpu_cores} cores    RAM  {p.ram_gb:.1f} GB    "
             f"GPU  {p.gpu_name}    VRAM  {p.vram_gb:.1f} GB"
         )
         self._hw_status.setStyleSheet(f"color: {_TEXT}; background: transparent;")
-
+        layout = self._hw_panel.layout()
         ollama_row = _label(
-            f"Ollama:  {'Detected ✓' if p.ollama_installed else 'Not found — please install'}",
+            f"Ollama:  {'Detected ✓' if p.ollama_installed else 'Not found — install for offline AI'}",
             10,
-            _GREEN if p.ollama_installed else _RED,
+            _GREEN if p.ollama_installed else _DIM,
         )
         layout.addWidget(ollama_row)
-
         if not p.ollama_installed:
             self._btn_install.setVisible(True)
 
@@ -298,23 +378,85 @@ class SetupWizard(QWidget):
         layout = self._rec_panel.layout()
         self._rec_status.setText(r.description)
         self._rec_status.setStyleSheet(f"color: {_ACCENT}; background: transparent;")
-
         layout.addWidget(_label(f"LLM model:   {r.llm_model}", 10, _TEXT))
         layout.addWidget(_label(f"Code model:  {r.llm_code_model}", 10, _TEXT))
         layout.addWidget(_label(f"STT model:   faster-whisper/{r.stt_model}", 10, _TEXT))
 
         if r.needs_cloud:
-            layout.addWidget(_label("Cloud mode via Groq API (free tier)", 9, _DIM))
-            # No model to pull — just let user launch
+            layout.addWidget(_label("Recommended: Groq cloud API (free tier, fastest)", 9, _DIM))
             self._btn_pull.setVisible(False)
-            self._btn_launch.setVisible(True)
-            self._save_config(r)
+            self._btn_groq_link.setVisible(True)
+            self._api_section.setVisible(True)
+            # Check if key already saved
+            existing = self._load_existing_groq_key()
+            if existing:
+                self._key_input.setText(existing)
         else:
             if self._profile and self._profile.ollama_installed:
                 self._btn_pull.setEnabled(True)
             self._btn_pull.setText(f"Download  {r.llm_model}")
 
-    # ── Model pull ────────────────────────────────────────────────────────────
+    # ── Groq key handling ─────────────────────────────────────────────────────
+
+    def _load_existing_groq_key(self) -> str:
+        secrets = DATA_DIR / "secrets.env"
+        if not secrets.exists():
+            return ""
+        for line in secrets.read_text().splitlines():
+            if line.startswith("GROQ_API_KEY="):
+                return line.partition("=")[2].strip()
+        return ""
+
+    def _on_key_changed(self, text: str) -> None:
+        ok = len(text.strip()) > 20
+        self._btn_test.setEnabled(ok)
+        if self._groq_verified:
+            self._groq_verified = False
+            self._btn_launch.setVisible(False)
+            self._key_status.setText("")
+
+    def _test_groq_key(self) -> None:
+        key = self._key_input.text().strip()
+        if not key:
+            return
+        self._btn_test.setEnabled(False)
+        self._btn_test.setText("…")
+        self._key_status.setText("Testing key…")
+        self._key_status.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        self._groq_thread = GroqTestThread(key)
+        self._groq_thread.result.connect(self._on_groq_result)
+        self._groq_thread.start()
+
+    def _on_groq_result(self, ok: bool, message: str) -> None:
+        self._btn_test.setText("Test")
+        self._btn_test.setEnabled(True)
+        color = _GREEN if ok else _RED
+        self._key_status.setText(("✓  " if ok else "✗  ") + message)
+        self._key_status.setStyleSheet(f"color: {color}; background: transparent;")
+        if ok:
+            self._groq_verified = True
+            self._save_groq_key(self._key_input.text().strip())
+            if self._rec:
+                self._save_config(self._rec)
+            self._btn_launch.setVisible(True)
+
+    def _save_groq_key(self, key: str) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        secrets = DATA_DIR / "secrets.env"
+        lines = []
+        found = False
+        if secrets.exists():
+            for line in secrets.read_text().splitlines():
+                if line.startswith("GROQ_API_KEY="):
+                    lines.append(f"GROQ_API_KEY={key}")
+                    found = True
+                else:
+                    lines.append(line)
+        if not found:
+            lines.append(f"GROQ_API_KEY={key}")
+        secrets.write_text("\n".join(lines) + "\n")
+
+    # ── Ollama model pull ─────────────────────────────────────────────────────
 
     def _pull_model(self) -> None:
         if self._rec is None:
@@ -323,20 +465,10 @@ class SetupWizard(QWidget):
         self._btn_skip.setEnabled(False)
         self._bar.setVisible(True)
         self._log.setText("Starting download…")
-
         self._pull_thread = PullThread(self._rec.llm_model)
-        self._pull_thread.progress.connect(self._on_pull_progress)
+        self._pull_thread.progress.connect(lambda l: self._log.setText(l[-120:]))
         self._pull_thread.done.connect(self._on_pull_done)
         self._pull_thread.start()
-
-        # Also pull code model if different
-        if self._rec.llm_code_model != self._rec.llm_model:
-            self._code_pull = PullThread(self._rec.llm_code_model)
-            self._code_pull.progress.connect(self._on_pull_progress)
-            # don't connect done — let main model drive completion
-
-    def _on_pull_progress(self, line: str) -> None:
-        self._log.setText(line[-120:])
 
     def _on_pull_done(self, success: bool) -> None:
         self._bar.setVisible(False)
@@ -348,17 +480,15 @@ class SetupWizard(QWidget):
             )
             if self._rec:
                 self._save_config(self._rec)
-                # Pull code model if different (fire-and-forget)
                 if self._rec.llm_code_model != self._rec.llm_model:
-                    self._log.setText("Downloading code model in background…")
                     t = PullThread(self._rec.llm_code_model)
                     t.done.connect(lambda ok: self._log.setText(
-                        "All models ready." if ok else "Code model download failed — can use main model."
+                        "All models ready." if ok else "Code model failed — main model will be used."
                     ))
                     t.start()
             self._btn_launch.setVisible(True)
         else:
-            self._log.setText("Download failed. You can retry or skip.")
+            self._log.setText("Download failed. Check your connection and retry.")
             self._btn_pull.setEnabled(True)
             self._btn_skip.setEnabled(True)
 
@@ -393,7 +523,11 @@ class SetupWizard(QWidget):
         import webbrowser
         webbrowser.open("https://ollama.com/download")
 
-    # ── Drag to move (frameless) ──────────────────────────────────────────────
+    def _open_groq_site(self) -> None:
+        import webbrowser
+        webbrowser.open("https://console.groq.com/keys")
+
+    # ── Drag (frameless) ──────────────────────────────────────────────────────
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -411,10 +545,7 @@ def needs_setup() -> bool:
 
 
 def apply_user_config() -> None:
-    """Overlay user_config.json and secrets.env on top of APP_CONFIG."""
     from config import APP_CONFIG
-
-    # Load secrets.env (KEY=VALUE lines, no spaces around =)
     secrets_file = DATA_DIR / "secrets.env"
     if secrets_file.exists():
         for line in secrets_file.read_text().splitlines():
@@ -424,7 +555,6 @@ def apply_user_config() -> None:
             key, _, val = line.partition("=")
             if key == "GROQ_API_KEY":
                 APP_CONFIG.groq_api_key = val.strip()
-
     if not USER_CONFIG.exists():
         return
     try:
@@ -437,7 +567,6 @@ def apply_user_config() -> None:
 
 
 def run_wizard() -> None:
-    """Run the setup wizard standalone (blocks until closed)."""
     app = QApplication.instance() or QApplication(sys.argv)
     wizard = SetupWizard()
     wizard.show()
