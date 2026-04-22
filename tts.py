@@ -60,6 +60,28 @@ class TTSManager(QObject):
         self._next_sentence_ready.connect(self._on_next_ready)
         self._playback_complete.connect(self._advance_or_finish)
 
+        # Pre-warm SAPI engine in background so first speak() is instant
+        self._sapi_lock = threading.Lock()
+        self._sapi_engine = None
+        self._sapi_rate = 190
+        threading.Thread(target=self._warm_sapi, daemon=True).start()
+
+    def _warm_sapi(self) -> None:
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+        try:
+            engine = pyttsx3.init()
+            self._configure_fallback(engine)
+            engine.setProperty("rate", self._sapi_rate)
+            engine.setProperty("volume", 1.0)
+            with self._sapi_lock:
+                self._sapi_engine = engine
+        except Exception:
+            pass
+
     @property
     def is_speaking(self) -> bool:
         return self._playing
@@ -67,7 +89,7 @@ class TTSManager(QObject):
     # ── Public API ────────────────────────────────────────────────────────────
 
     def speak(self, text: str, language: str) -> None:
-        """Split text into sentences and play them sequentially. First sentence starts ASAP."""
+        """Split text into sentences and play sequentially via edge-tts (neural quality)."""
         self.stop()
         self._stopping = False
         self._sentence_language = language
@@ -76,11 +98,36 @@ class TTSManager(QObject):
             self.finished.emit()
             return
         self._sentence_queue = sentences[1:]
+
+        first = sentences[0]
+        # Always prefer edge-tts (neural quality); SAPI is last-resort fallback only.
         threading.Thread(
             target=self._prepare_and_signal,
-            args=(sentences[0],),
+            args=(first,),
             daemon=True,
         ).start()
+
+    def _sapi_speak_fast(self, text: str) -> None:
+        """Speak a short sentence immediately via pre-warmed SAPI — no network, no temp file."""
+        if self._stopping:
+            return
+        self._playing = True
+        try:
+            with self._sapi_lock:
+                engine = self._sapi_engine
+                if engine is None:
+                    raise RuntimeError("SAPI not ready")
+                engine.say(text)
+                engine.runAndWait()
+        except Exception:
+            # SAPI failed — fall back to edge-tts
+            payload = self.prepare(text, self._sentence_language)
+            if not self._stopping:
+                self._next_sentence_ready.emit(payload)
+            return
+        self._playing = False
+        if not self._stopping:
+            self._playback_complete.emit()
 
     def prepare(self, text: str, language: str = "en") -> SpeechPayload | None:
         if not APP_CONFIG.voice_enabled or not text.strip():

@@ -16,7 +16,7 @@ class Config:
 
     # ── Audio ──────────────────────────────────────────────────────────
     sample_rate: int = 16_000
-    blocksize: int = 4_096
+    blocksize: int = 2_048          # smaller = faster VAD response
     rms_floor: float = 0.0028
     peak_floor: float = 0.028
 
@@ -26,13 +26,14 @@ class Config:
     wake_cooldown_seconds: float = 3.0
 
     # ── Voice capture ──────────────────────────────────────────────────
-    capture_max_seconds: int = 12
-    capture_silence_seconds: float = 1.1
+    capture_max_seconds: int = 10
+    capture_silence_seconds: float = 0.38   # shorter silence = faster turn-around
 
     # ── STT ────────────────────────────────────────────────────────────
-    whisper_model_size: str = "small"
+    whisper_model_size: str = "small"       # small: ~3% WER vs base's ~5% — better accuracy, similar speed on GPU
     whisper_compute_type: str = "float16"
     whisper_threads: int = 4
+    whisper_beam_size: int = 1              # beam=1: fastest; increase to 3 for more accuracy
 
     # ── LLM provider ───────────────────────────────────────────────────
     # "ollama" → local Ollama   |   "groq" → Groq cloud API
@@ -51,20 +52,20 @@ class Config:
 
     # ── Shared LLM settings ─────────────────────────────────────────────
     vision_model: str = "llava:7b"
-    ollama_temperature: float = 0.7
-    ollama_ctx: int = 8192
+    ollama_temperature: float = 0.6
+    ollama_ctx: int = 4096
     history_max_turns: int = 15
     history_max_tokens: int = 2000
 
     # ── TTS ────────────────────────────────────────────────────────────
     voice_enabled: bool = True
-    # edge-tts (online)
-    en_voice: str = "en-US-AriaNeural"
-    en_voice_rate: str = "+10%"
-    en_voice_pitch: str = "-8Hz"
+    # edge-tts (online) — JennyNeural: calm, controlled, precise female voice
+    en_voice: str = "en-US-JennyNeural"
+    en_voice_rate: str = "-8%"     # slightly slower = deliberate, authoritative pacing
+    en_voice_pitch: str = "-5Hz"   # slightly lower = composed authority
     tr_voice: str = "tr-TR-EmelNeural"
-    tr_voice_rate: str = "+5%"
-    tr_voice_pitch: str = "+0Hz"
+    tr_voice_rate: str = "-4%"
+    tr_voice_pitch: str = "-4Hz"
     # Piper (offline fallback) — set paths after installing piper-tts models
     piper_executable: str = "piper"          # or full path e.g. C:/piper/piper.exe
     en_piper_model: str = ""                 # e.g. C:/piper/models/en_GB-alba-medium.onnx

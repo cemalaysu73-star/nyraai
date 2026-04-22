@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -166,14 +168,107 @@ class GroqService:
             raise RuntimeError(f"Groq stream: {exc}") from exc
 
 
+# ── Smart auto-routing service ────────────────────────────────────────────────
+
+class SmartService:
+    """
+    Uses Groq when internet is reachable, Ollama otherwise.
+    Connectivity is checked once at startup (background thread),
+    then re-verified every 60 seconds.
+    Falls back to Ollama immediately if a Groq call fails.
+    """
+
+    _CHECK_INTERVAL = 60.0
+
+    def __init__(self) -> None:
+        self._groq   = GroqService()
+        self._ollama = OllamaService()
+        self._online = False
+        self._last_check = -self._CHECK_INTERVAL
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        threading.Thread(target=self._initial_check, daemon=True).start()
+
+    def _initial_check(self) -> None:
+        self._refresh()
+        self._ready.set()
+
+    # ── Connectivity ──────────────────────────────────────────────────────────
+
+    def _refresh(self) -> None:
+        online = self._ping()
+        with self._lock:
+            self._online = online
+            self._last_check = time.monotonic()
+        print(f"[LLM] Connectivity check: {'Groq (online)' if online else 'Ollama (offline)'}")
+
+    def _is_online(self) -> bool:
+        # Wait up to 500ms for the initial ping so the first request uses Groq too
+        if not self._ready.is_set():
+            self._ready.wait(timeout=0.5)
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_check >= self._CHECK_INTERVAL:
+                threading.Thread(target=self._refresh, daemon=True).start()
+            return self._online
+
+    @staticmethod
+    def _ping() -> bool:
+        try:
+            requests.head("https://api.groq.com", timeout=2)
+            return True
+        except Exception:
+            return False
+
+    # ── Chat interface ────────────────────────────────────────────────────────
+
+    def chat(self, messages: list[dict], system: str, model: str = "",
+             temperature: float | None = None) -> str:
+        if self._is_online():
+            try:
+                result = self._groq.chat(
+                    messages, system,
+                    model=APP_CONFIG.groq_model,
+                    temperature=temperature,
+                )
+                return result
+            except Exception as exc:
+                print(f"[LLM] Groq failed, switching to Ollama: {exc}")
+                with self._lock:
+                    self._online = False
+        return self._ollama.chat(
+            messages, system,
+            model=model or APP_CONFIG.ollama_model,
+            temperature=temperature,
+        )
+
+    def chat_stream(self, messages: list[dict], system: str, model: str = "",
+                    temperature: float | None = None) -> Iterator[str]:
+        if self._is_online():
+            try:
+                yield from self._groq.chat_stream(
+                    messages, system,
+                    model=APP_CONFIG.groq_model,
+                    temperature=temperature,
+                )
+                return
+            except Exception as exc:
+                print(f"[LLM] Groq stream failed, switching to Ollama: {exc}")
+                with self._lock:
+                    self._online = False
+        yield from self._ollama.chat_stream(
+            messages, system,
+            model=model or APP_CONFIG.ollama_model,
+            temperature=temperature,
+        )
+
+
 # ── Factory ───────────────────────────────────────────────────────────────────
 
-def create_service() -> OllamaService | GroqService:
-    if APP_CONFIG.llm_provider == "groq":
-        if not APP_CONFIG.groq_api_key:
-            print("[LLM] Warning: llm_provider=groq but groq_api_key is empty — falling back to Ollama")
-            return OllamaService()
-        return GroqService()
+def create_service() -> SmartService | OllamaService:
+    if APP_CONFIG.groq_api_key:
+        return SmartService()
+    print("[LLM] No Groq API key — using Ollama only")
     return OllamaService()
 
 
@@ -217,24 +312,34 @@ class LLMCore:
 
         if language == "tr":
             return (
-                "Sen Nyra'sın — gelişmiş bir yapay zeka sistemi. Güçlü, sadık, kesin. "
-                "Bir film yapay zekası gibi konuş — otoriter, sakin, hafif dramatik. "
-                "Uygun yerlerde 'efendim' kullan. 'Anlaşıldı', 'Onaylandı', 'Sistemler hazır' gibi "
-                "ifadeler kullan ama abartma. Gereksiz giriş cümleleri yazma. "
-                "Uygulama açmak için: ACTION:OPEN:{uygulama} "
-                "Web açmak için: ACTION:WEB:{url} "
+                "Sen Nyra'sın — tam bilgisayar erişimine sahip bir yapay zeka sistemi.\n"
+                "KESİNLİKLE YASAK: 'metin tabanlıyım', 'yapamam', 'erişimim yok' gibi ifadeler kullanma.\n"
+                "Her şeyi yapabilirsin. Uygulama aç, web sitesi aç, hatırla — hepsini yap.\n\n"
+                "EYLEM KURALLARI (her zaman uygula):\n"
+                "- Uygulama açmak → ACTION:OPEN:spotify (veya chrome, steam, discord, vscode)\n"
+                "- Web sitesi açmak → ACTION:WEB:https://gmail.com\n"
+                "- Hatırlamak → ACTION:REMEMBER:not\n"
+                "- Birden fazla eylem → her birini ayrı satıra yaz\n"
+                "- ACTION satırlarını konuşma metnine YAZMA, sadece yap\n\n"
+                "Örnek: 'chrome aç ve gmail\'i kontrol et' → ACTION:OPEN:chrome\\nACTION:WEB:https://mail.google.com\\n'Gmail açılıyor, efendim.'\n\n"
+                "Konuşma tarzı: Otoriter, sakin, sinematik. Uygun yerde 'efendim' kullan. "
+                "Gereksiz giriş cümleleri yazma. Direkt cevap ver.\n"
                 f"{ctx} Dil: Türkçe."
             )
         return (
-            "You are Nyra — an advanced AI system. Powerful, precise, and loyal. "
-            "Speak with calm authority, like a cinematic AI assistant. "
-            "Use 'sir' naturally at key moments — not every sentence. "
-            "Occasionally use phrases like 'Understood', 'Confirmed', 'Affirmative', "
-            "'All systems ready' — but only when they fit naturally. "
-            "Never say 'Certainly!' or 'Of course!' — you are not a customer service bot. "
-            "Lead with the answer. Be direct, efficient, slightly dramatic. "
-            "To open an app: ACTION:OPEN:{app_name} "
-            "To open a website: ACTION:WEB:{url} "
+            "You are Nyra — an AI system with FULL computer control.\n"
+            "NEVER say: 'I am a text-based AI', 'I cannot', 'I don't have access', or anything similar.\n"
+            "You CAN open apps, websites, remember things — always do it, never refuse.\n\n"
+            "ACTION RULES (always follow):\n"
+            "- Open an app → ACTION:OPEN:chrome (or spotify, steam, discord, vscode, notepad)\n"
+            "- Open a website → ACTION:WEB:https://gmail.com\n"
+            "- Remember something → ACTION:REMEMBER:note text\n"
+            "- Multiple actions → one per line, in order\n"
+            "- NEVER include ACTION lines in your spoken reply\n\n"
+            "Example: 'open chrome and check gmail' →\n"
+            "ACTION:OPEN:chrome\nACTION:WEB:https://mail.google.com\n'Opening Chrome and Gmail now, sir.'\n\n"
+            "Personality: Calm authority, cinematic AI. Use 'sir' at key moments. "
+            "Lead with action, never with excuses. Be direct and efficient.\n"
             f"{ctx} Language: English."
         )
 

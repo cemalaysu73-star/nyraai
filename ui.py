@@ -20,16 +20,16 @@ except Exception:
     _GPU_HANDLE = None
 
 from PySide6.QtCore import (
-    QEasingCurve, QPoint, QPropertyAnimation, QRunnable,
+    QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRunnable,
     QThread, QThreadPool, QTimer, Qt, QObject, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QIcon, QLinearGradient,
+    QAction, QBrush, QColor, QFont, QIcon, QLinearGradient,
     QPainter, QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel,
-    QMainWindow, QPushButton, QSizePolicy,
+    QMainWindow, QPushButton, QScrollArea, QSizePolicy,
     QSystemTrayIcon, QVBoxLayout, QMenu, QWidget,
 )
 
@@ -39,7 +39,11 @@ from actions import (
     volume_up, volume_down, volume_mute, volume_set,
     media_play_pause, media_next, media_prev, media_stop,
     window_close, window_minimize, window_maximize,
-    system_lock, system_sleep,
+    steam_update_games, install_app, fetch_world_news,
+    system_lock, system_sleep, system_wake,
+    system_info, take_screenshot, clipboard_read, clipboard_write,
+    type_text, send_hotkey, open_folder, file_find,
+    network_info, process_list, brightness_set,
 )
 from agent import AgentCore
 from config import APP_CONFIG
@@ -54,6 +58,9 @@ from screen import ScreenAwareness, ScreenContext
 from stt import STT
 from tts import TTSManager
 from wake import WakeDetector, capture_command
+from self_improve import SelfImprove
+from mode_detector import detect as _detect_mode, status_text as _mode_status
+from agent import clean_for_tts as _clean_for_tts
 
 
 # ── Worker helpers ────────────────────────────────────────────────────────────
@@ -179,124 +186,344 @@ class BargeinMonitor(QThread):
 
 # ── Orb ──────────────────────────────────────────────────────────────────────
 
+_STATE_GLOW = {
+    "idle":      (255, 200, 170,  70),
+    "listening": (110, 170, 255,  95),
+    "thinking":  (170, 130, 255,  85),
+    "speaking":  (255, 210, 100, 115),
+    "wake":      (255, 255, 180, 130),
+}
+_STATE_CORE = {
+    "idle":      ("#FFF2E8", "#D8B4A0", "#4E3D3B", "#161416"),
+    "listening": ("#E8F2FF", "#90B8E0", "#243A58", "#090D14"),
+    "thinking":  ("#F2E8FF", "#B490E0", "#382458", "#0E0914"),
+    "speaking":  ("#FFFAE0", "#E0CC80", "#584A24", "#141209"),
+    "wake":      ("#FFFFF0", "#E0E080", "#585824", "#141409"),
+}
+_STATE_WAVE = {
+    "idle": (255, 210, 180),
+    "listening": (120, 180, 255),
+    "thinking": (180, 140, 255),
+    "speaking": (255, 210, 100),
+    "wake": (255, 255, 160),
+}
+_STATE_STATUS_COLOR = {
+    "idle":      "#3A5270",
+    "listening": "#4A90D9",
+    "thinking":  "#9060D9",
+    "speaking":  "#D9A030",
+    "wake":      "#D9D040",
+}
+
+
 class OrbWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.state = "idle"
         self.phase = 0.0
-        self._points = self._build_points()
+        self._frame = 0
+        self._stars = self._build_stars()
+        self._shooting: list[dict] = []
+        self._shoot_cd = random.randint(150, 320)
+        # Cached pixmaps — rebuilt only when size changes or state changes
+        self._bg_pix: QPixmap | None = None
+        self._star_pix: QPixmap | None = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(70)
+        self._timer.start(16)   # 60 fps
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def set_state(self, state: str) -> None:
-        self.state = state
-        self.update()
+        if state != self.state:
+            self.state = state
+            self._star_pix = None   # force star rebuild on state change
 
-    def _build_points(self):
-        random.seed(7)
-        pts = []
-        for _ in range(240):
-            x, y = random.random(), random.random()
-            r = random.randint(1, 3)
-            offset = random.random() * math.pi * 2
-            # ~7% become bright "sparkle" stars
-            bright = random.random() < 0.07
-            pts.append((x, y, r, offset, bright))
-        return pts
+    # ── Star field construction ───────────────────────────────────────────────
+
+    def _build_stars(self) -> list[dict]:
+        rng = random.Random(42)
+        stars: list[dict] = []
+
+        def add(n, r_lo, r_hi, kind, colors):
+            for _ in range(n):
+                stars.append({
+                    "x": rng.random(), "y": rng.random(),
+                    "r": rng.uniform(r_lo, r_hi),
+                    "offset": rng.random() * math.pi * 2,
+                    "speed": rng.uniform(0.4, 1.4),
+                    "kind": kind,
+                    "rgb": rng.choice(colors),
+                })
+
+        add(160, 0.4, 1.0, "dim",      [(210, 225, 255), (240, 245, 255)])
+        add(80,  1.0, 1.7, "mid",      [(200, 220, 255), (255, 248, 235)])
+        add(30,  1.6, 2.5, "bright",   [(220, 235, 255), (255, 230, 180)])
+        add(8,   2.8, 3.6, "brilliant",[(200, 225, 255), (255, 220, 160)])
+        return stars
+
+    # ── Animation tick ────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
-        self.phase = (self.phase + 0.055) % (math.pi * 2)
+        self.phase = (self.phase + 0.020) % (math.pi * 2)
+        self._frame += 1
+
+        self._shoot_cd -= 1
+        if self._shoot_cd <= 0:
+            self._shoot_cd = random.randint(200, 400)
+            self._shooting.append({
+                "x": random.uniform(0.0, 0.70),
+                "y": random.uniform(0.04, 0.45),
+                "dx": random.uniform(0.003, 0.008),
+                "dy": random.uniform(0.001, 0.003),
+                "life": 1.0,
+                "tail": random.uniform(0.10, 0.22),
+            })
+
+        alive = []
+        for s in self._shooting:
+            s["x"] += s["dx"]
+            s["y"] += s["dy"]
+            s["life"] -= 0.028
+            if s["life"] > 0 and s["x"] < 1.1:
+                alive.append(s)
+        self._shooting = alive
+
+        # Stars run at 15 fps (every 4 frames) — orb runs at full 60 fps
+        if self._frame % 4 == 0:
+            self._star_pix = None
+
         self.update()
 
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect()
+    # ── Cached background (gradient + nebula) ─────────────────────────────────
 
-        bg = QLinearGradient(0, 0, rect.width(), rect.height())
-        bg.setColorAt(0.0, QColor("#050507"))
-        bg.setColorAt(0.5, QColor("#0C0A0D"))
-        bg.setColorAt(1.0, QColor("#060608"))
-        painter.fillRect(rect, bg)
-
-        for x_n, y_n, r, offset, bright in self._points:
-            x = int(16 + x_n * (rect.width() - 32))
-            y = int(16 + y_n * (rect.height() - 32))
-            twinkle = math.sin(self.phase * 1.4 + offset)
-            if bright:
-                alpha = min(255, 65 + int((twinkle + 1) * 95))
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(255, 250, 245, alpha))
-                painter.drawEllipse(QPoint(x, y), r + 1, r + 1)
-                span = r * 4
-                painter.setPen(QPen(QColor(255, 248, 240, max(0, alpha // 4)), 1))
-                painter.drawLine(x - span, y, x + span, y)
-                painter.drawLine(x, y - span, x, y + span)
-            else:
-                alpha = 5 + int((twinkle + 1) * 17)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(210, 228, 255, alpha))
-                painter.drawEllipse(QPoint(x, y), r, r)
-
-        cx = int(rect.width() * 0.5)
-        cy = int(rect.height() * 0.5)
-        center = QPoint(cx, cy)
-        radius = min(rect.width(), rect.height()) * 0.22
-
-        amp = {"idle": 3, "listening": 10, "thinking": 6, "speaking": 14, "wake": 16}.get(self.state, 3)
-        waveform_y = rect.height() - 28
-        painter.setPen(QPen(QColor(255, 210, 180, 90), 1.4))
-        last = QPoint(14, waveform_y)
-        for x in range(14, rect.width() - 14, 7):
-            wave = math.sin(self.phase * 4.0 + x * 0.044) + math.cos(self.phase * 2.4 + x * 0.021)
-            cur = QPoint(x, int(waveform_y + wave * amp))
-            painter.drawLine(last, cur)
-            last = cur
-
-        beam = QLinearGradient(cx, rect.top(), cx, rect.bottom())
-        beam.setColorAt(0.0, QColor(255, 245, 235, 0))
-        beam.setColorAt(0.5, QColor(255, 240, 224, 22))
-        beam.setColorAt(1.0, QColor(255, 245, 235, 0))
-        painter.fillRect(cx - 22, rect.top(), 44, rect.height(), beam)
-
-        outer = QRadialGradient(center, radius * 2.0)
-        speaking_boost = 30 if self.state == "speaking" else 0
-        outer.setColorAt(0.0, QColor(255, 200, 170, 80 + speaking_boost))
-        outer.setColorAt(0.5, QColor(244, 172, 132, 28))
-        outer.setColorAt(1.0, QColor(0, 0, 0, 0))
-        painter.setBrush(outer)
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(center, int(radius * 2.1), int(radius * 2.1))
-
-        core = QRadialGradient(cx - radius * 0.18, cy - radius * 0.22, radius * 1.05)
-        core.setColorAt(0.0, QColor("#FFF2E8"))
-        core.setColorAt(0.22, QColor("#D8B4A0"))
-        core.setColorAt(0.58, QColor("#4E3D3B"))
-        core.setColorAt(1.0, QColor("#161416"))
-        painter.setBrush(core)
-        painter.setPen(QPen(QColor(255, 228, 210, 100), 1.1))
-        painter.drawEllipse(center, int(radius), int(radius))
-
-        for scale_x, scale_y, color, rot in [
-            (1.55, 0.40, QColor(244, 200, 175, 120), self.phase * 32),
-            (1.32, 0.66, QColor(222, 210, 205, 90), -self.phase * 26),
-            (1.80, 0.84, QColor(255, 165, 130, 55), self.phase * 17),
+    def _build_bg_pix(self, W: int, H: int) -> QPixmap:
+        pix = QPixmap(W, H)
+        p = QPainter(pix)
+        bg = QLinearGradient(0, 0, W * 0.6, H)
+        bg.setColorAt(0.0, QColor("#020307"))
+        bg.setColorAt(0.45, QColor("#050810"))
+        bg.setColorAt(1.0, QColor("#030508"))
+        p.fillRect(pix.rect(), bg)
+        for nx, ny, nr, ng, nb, na in [
+            (0.12, 0.22, 55, 15, 110, 18),
+            (0.88, 0.72, 15, 50, 110, 14),
+            (0.50, 0.08, 80, 25,  25, 12),
+            (0.75, 0.30, 20, 80,  60, 10),
         ]:
-            painter.save()
-            painter.translate(center)
-            painter.rotate(rot * 57.2958)
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(color, 1.1))
-            painter.drawEllipse(QPoint(0, 0), int(radius * scale_x), int(radius * scale_y))
-            painter.restore()
+            grad = QRadialGradient(nx * W, ny * H, min(W, H) * 0.28)
+            grad.setColorAt(0.0, QColor(nr, ng, nb, na))
+            grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.fillRect(pix.rect(), grad)
+        p.end()
+        return pix
 
-        painter.setPen(QColor(222, 210, 200, 140))
-        painter.setFont(QFont("Segoe UI Variable", 8, QFont.Medium))
-        painter.drawText(14, 20, "NYRA")
-        painter.setPen(QColor(255, 165, 120, 130))
-        painter.drawText(14, 34, self.state.upper())
+    # ── Cached star field (rebuilt at 15 fps) ─────────────────────────────────
+
+    def _build_star_pix(self, W: int, H: int, boost: int) -> QPixmap:
+        pix = QPixmap(W, H)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing)
+        ph = self.phase
+        for s in self._stars:
+            sx = int(s["x"] * W)
+            sy = int(s["y"] * H)
+            tw = math.sin(ph * s["speed"] + s["offset"])
+            rgb = s["rgb"]
+            kind = s["kind"]
+
+            if kind == "dim":
+                a = max(0, 8 + int((tw + 1) * 16) + boost // 4)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(*rgb, a))
+                ri = max(1, int(s["r"]))
+                p.drawEllipse(QPoint(sx, sy), ri, ri)
+
+            elif kind == "mid":
+                a = max(0, 22 + int((tw + 1) * 34) + boost // 3)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(*rgb, a))
+                p.drawEllipse(QPoint(sx, sy), int(s["r"]), int(s["r"]))
+
+            elif kind == "bright":
+                a = min(255, max(0, 60 + int((tw + 1) * 90) + boost))
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(*rgb, a))
+                ri = int(s["r"])
+                p.drawEllipse(QPoint(sx, sy), ri, ri)
+                span = int(s["r"] * 5)
+                p.setPen(QPen(QColor(*rgb, max(0, a // 3)), 1.0))
+                p.drawLine(sx - span, sy, sx + span, sy)
+                p.drawLine(sx, sy - span, sx, sy + span)
+
+            elif kind == "brilliant":
+                a = min(255, max(0, 90 + int((tw + 1) * 110) + boost))
+                glow_r = int(s["r"] * 6)
+                gl = QRadialGradient(sx, sy, glow_r)
+                gl.setColorAt(0.0, QColor(*rgb, a // 2))
+                gl.setColorAt(1.0, QColor(0, 0, 0, 0))
+                p.setBrush(gl)
+                p.setPen(Qt.NoPen)
+                p.drawEllipse(QPoint(sx, sy), glow_r, glow_r)
+                ri = int(s["r"])
+                p.setBrush(QColor(*rgb, a))
+                p.drawEllipse(QPoint(sx, sy), ri, ri)
+                span = int(s["r"] * 9)
+                p.setPen(QPen(QColor(*rgb, max(0, a // 2)), 1.1))
+                p.drawLine(sx - span, sy, sx + span, sy)
+                p.drawLine(sx, sy - span, sx, sy + span)
+        p.end()
+        return pix
+
+    # ── Paint ─────────────────────────────────────────────────────────────────
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect()
+        W, H = r.width(), r.height()
+
+        # 1 ── Background (cached — only rebuilt on resize)
+        if self._bg_pix is None or self._bg_pix.width() != W or self._bg_pix.height() != H:
+            self._bg_pix = self._build_bg_pix(W, H)
+            self._star_pix = None   # force star rebuild on resize too
+        p.drawPixmap(0, 0, self._bg_pix)
+
+        # 2 ── Star field (cached — rebuilt at 15 fps)
+        boost = {"idle": 0, "listening": 18, "thinking": 10, "speaking": 24, "wake": 35}.get(self.state, 0)
+        if self._star_pix is None or self._star_pix.width() != W or self._star_pix.height() != H:
+            self._star_pix = self._build_star_pix(W, H, boost)
+        p.drawPixmap(0, 0, self._star_pix)
+
+        # 3 ── Shooting stars (always live — rare, cheap)
+        for ss in self._shooting:
+            hx = int(ss["x"] * W)
+            hy = int(ss["y"] * H)
+            tx = int((ss["x"] - ss["dx"] * ss["tail"] * 90) * W)
+            ty = int((ss["y"] - ss["dy"] * ss["tail"] * 90) * H)
+            a = int(ss["life"] * 220)
+            sg = QLinearGradient(float(hx), float(hy), float(tx), float(ty))
+            sg.setColorAt(0.0, QColor(255, 255, 255, a))
+            sg.setColorAt(0.6, QColor(200, 220, 255, a // 3))
+            sg.setColorAt(1.0, QColor(180, 200, 255, 0))
+            p.setPen(QPen(QBrush(sg), 1.5))
+            p.drawLine(hx, hy, tx, ty)
+            hg = QRadialGradient(float(hx), float(hy), 3.5)
+            hg.setColorAt(0.0, QColor(255, 255, 255, min(255, a)))
+            hg.setColorAt(1.0, QColor(200, 220, 255, 0))
+            p.setBrush(hg)
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(QPoint(hx, hy), 3, 3)
+
+        # ── Orb geometry ──────────────────────────────────────────────────────
+        cx, cy = W // 2, H // 2
+        center = QPoint(cx, cy)
+        radius = min(W, H) * 0.22
+        pulse = 1.0 + math.sin(self.phase * 1.9) * 0.013   # subtle breathe
+        core_r = int(radius * pulse)
+
+        gr   = _STATE_GLOW.get(self.state, (255, 200, 170, 70))
+        wrgb = _STATE_WAVE.get(self.state, (255, 210, 180))
+        cc   = _STATE_CORE.get(self.state, _STATE_CORE["idle"])
+
+        # 4 ── Outer atmosphere (wide, very soft)
+        atm = QRadialGradient(center, radius * 3.4)
+        atm.setColorAt(0.0, QColor(gr[0], gr[1], gr[2], 20))
+        atm.setColorAt(0.55, QColor(gr[0], gr[1], gr[2], 6))
+        atm.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setBrush(atm)
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(center, int(radius * 3.4), int(radius * 3.4))
+
+        # 5 ── Glow ring
+        outer = QRadialGradient(center, radius * 2.2)
+        outer.setColorAt(0.0, QColor(*gr))
+        outer.setColorAt(0.42, QColor(gr[0], gr[1], gr[2], gr[3] // 3))
+        outer.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setBrush(outer)
+        p.drawEllipse(center, int(radius * 2.2), int(radius * 2.2))
+
+        # 6 ── Orbital rings (4, clean)
+        for sx_r, sy_r, col, rot, lw in [
+            (1.52, 0.38, QColor(*gr[:3], 88),        self.phase * 28,  1.0),
+            (1.30, 0.62, QColor(222, 210, 205, 60),  -self.phase * 22, 0.9),
+            (1.78, 0.80, QColor(*gr[:3], 36),         self.phase * 15,  0.8),
+            (2.10, 0.24, QColor(180, 210, 255, 28),  -self.phase * 10,  0.7),
+        ]:
+            p.save()
+            p.translate(center)
+            p.rotate(rot * 57.2958)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(col, lw))
+            p.drawEllipse(QPoint(0, 0), int(radius * sx_r * pulse), int(radius * sy_r * pulse))
+            p.restore()
+
+        # 7 ── Orbiting particles
+        for i in range(6):
+            angle = self.phase * 1.4 + (i / 6) * math.pi * 2
+            px2 = int(cx + radius * 1.44 * math.cos(angle))
+            py2 = int(cy + radius * 0.36 * math.sin(angle))
+            pa = max(0, int(115 * (math.sin(angle) + 1) / 2))
+            ps = max(1, int(2.0 * (math.sin(angle * 0.5) + 1.5)))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(*gr[:3], pa))
+            p.drawEllipse(QPoint(px2, py2), ps, ps)
+
+        # 8 ── Orb core (glass sphere)
+        sphere = QRadialGradient(cx - radius * 0.26, cy - radius * 0.30, radius * 1.1)
+        sphere.setColorAt(0.0,  QColor(cc[0]))
+        sphere.setColorAt(0.20, QColor(cc[1]))
+        sphere.setColorAt(0.55, QColor(cc[2]))
+        sphere.setColorAt(1.0,  QColor(cc[3]))
+        p.setBrush(sphere)
+        p.setPen(QPen(QColor(*gr[:3], 75), 1.0))
+        p.drawEllipse(center, core_r, core_r)
+
+        # Specular highlight — top-left catch light (glass effect)
+        spec = QRadialGradient(cx - radius * 0.34, cy - radius * 0.38, radius * 0.50)
+        spec.setColorAt(0.0, QColor(255, 255, 255, 95))
+        spec.setColorAt(0.45, QColor(255, 255, 255, 22))
+        spec.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.setBrush(spec)
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(center, core_r, core_r)
+
+        # Inner colored glow
+        inner_g = QRadialGradient(center, radius * 0.65)
+        inner_g.setColorAt(0.0, QColor(*wrgb, 40))
+        inner_g.setColorAt(1.0, QColor(*wrgb, 0))
+        p.setBrush(inner_g)
+        p.drawEllipse(center, core_r, core_r)
+
+        # 9 ── Waveform (3-pixel step, smoother)
+        amp = {"idle": 2, "listening": 12, "thinking": 6, "speaking": 16, "wake": 19}.get(self.state, 2)
+        wy = H - 32
+        for ph_off, alpha, lw in [(0.0, 80, 1.4), (math.pi * 0.30, 32, 0.9)]:
+            p.setPen(QPen(QColor(*wrgb, alpha), lw))
+            lpt = QPoint(14, wy)
+            for x in range(14, W - 14, 3):
+                wave = (math.sin(self.phase * 4.5 + x * 0.040 + ph_off)
+                        + math.cos(self.phase * 2.8 + x * 0.018 + ph_off) * 0.50)
+                cpt = QPoint(x, int(wy + wave * amp))
+                p.drawLine(lpt, cpt)
+                lpt = cpt
+
+        # 10 ── Vertical beam
+        beam = QLinearGradient(cx, 0, cx, H)
+        beam.setColorAt(0.0,  QColor(*wrgb, 0))
+        beam.setColorAt(0.35, QColor(*wrgb, 11))
+        beam.setColorAt(0.65, QColor(*wrgb, 11))
+        beam.setColorAt(1.0,  QColor(*wrgb, 0))
+        p.fillRect(cx - 14, 0, 28, H, beam)
+
+        # 11 ── HUD text
+        p.setPen(QColor(200, 215, 235, 75))
+        p.setFont(QFont("Segoe UI Variable", 7, QFont.Medium))
+        p.drawText(14, 18, "NYRA  v2")
+        sc = _STATE_STATUS_COLOR.get(self.state, "#3A5270")
+        p.setPen(QColor(sc))
+        p.setFont(QFont("Cascadia Code", 7))
+        p.drawText(14, 32, self.state.upper())
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -339,7 +566,12 @@ class NyraWindow(QMainWindow):
         self._intent_store = IntentStore()
         self._behavior = BehaviorTracker()
         self._stt_repair = STTRepair()
+        self._improve = SelfImprove()
+        self._improve.start_background_loop()
         get_engine()   # start probing Ollama in background
+
+        self._si_route = ""
+        self._si_raw = ""
 
         self._language = memory.session.language or APP_CONFIG.default_language
         self._current_screen = ScreenContext()
@@ -435,7 +667,7 @@ class NyraWindow(QMainWindow):
         layout.addWidget(full_btn)
         layout.addWidget(close_btn)
 
-        QTimer(self, timeout=lambda: self.clock_label.setText(datetime.now().strftime("%H:%M"))).start(10_000)
+        QTimer(self, timeout=lambda: self.clock_label.setText(datetime.now().strftime("%H:%M"))).start(30_000)
         return bar
 
     def _build_orb(self) -> QWidget:
@@ -446,13 +678,23 @@ class NyraWindow(QMainWindow):
         bar = QFrame()
         bar.setObjectName("ResponseBar")
         layout = QVBoxLayout(bar)
-        layout.setContentsMargins(16, 10, 16, 10)
+        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setSpacing(6)
 
         self.response_label = QLabel("")
         self.response_label.setObjectName("ResponseLabel")
         self.response_label.setWordWrap(True)
         self.response_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.response_label)
+        self.response_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("ResponseScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(self.response_label)
+        scroll.setFrameShape(QFrame.NoFrame)
+        layout.addWidget(scroll)
         return bar
 
     # ── System tray ───────────────────────────────────────────────────────────
@@ -543,34 +785,34 @@ class NyraWindow(QMainWindow):
     def _on_transcribed(self, text: str, language: str) -> None:
         self._voice_inflight = False
         self._language = language
-        self.memory.set_language(language)
+        # Disk write — don't block main thread
+        worker = _Runnable(self.memory.set_language, language)
+        self._pool.start(worker)
 
         lower = text.lower().strip()
 
         bargein = self._bargein_mode
         self._bargein_mode = False
 
-        # Wake word required unless this is a barge-in
         if not bargein and not any(w in lower for w in _WAKE_VARIANTS):
             QTimer.singleShot(100, self._queue_voice_capture)
             return
 
-        # Strip wake word, keep the actual command
         command = lower
         for w in _WAKE_VARIANTS:
             command = command.replace(w, "")
         command = command.strip(" ,.!?")
 
-        # STT repair: fix known transcription errors before routing
         command = self._stt_repair.repair(command)
 
         self._speech_paused = False
 
         if command:
             self._last_voice_text = command
+            # Set state BEFORE any processing so the orb updates instantly
+            self._set_state("thinking", "Thinking")
             self._process_input(command, source="voice")
         else:
-            # Only "nyra" was said — acknowledge
             ack = "Yes, sir." if self._language == "en" else "Efendim?"
             self._set_response(ack)
             self._set_state("speaking", "Speaking")
@@ -591,13 +833,21 @@ class NyraWindow(QMainWindow):
             self._pause_speech()
             return
 
-        # Log every command + notify ambient that user is active
-        if self._life_log:
-            self._life_log.log_command(text)
-        if self._ambient:
-            self._ambient.notify_user_active()
+        self._improve.check_and_flag_correction(text)
 
-        self._set_state("thinking", "Thinking")
+        # Fire-and-forget disk I/O — never block the main thread
+        if self._life_log:
+            worker = _Runnable(self._life_log.log_command, text)
+            self._pool.start(worker)
+        if self._ambient:
+            threading.Thread(target=self._ambient.notify_user_active, daemon=True).start()
+
+        alias = self._improve.resolve(text)
+        if alias:
+            text = alias
+
+        self._si_raw = text
+
         result = route(text)
         if result.matched:
             self._execute_action(result, text)
@@ -606,6 +856,7 @@ class NyraWindow(QMainWindow):
         # Intent store: check frequency-learned patterns before hitting LLM
         intent_match = self._intent_store.match(text)
         if intent_match:
+            self._si_route = "intent"
             # Medium confidence (0.45–0.62): transcript might be corrupted → log for repair
             if intent_match.score < MATCH_THRESHOLD:
                 self._stt_repair.observe(text, intent_match.group.representative)
@@ -614,7 +865,20 @@ class NyraWindow(QMainWindow):
 
         self._run_llm(text)
 
+    def _run_slow_action(self, fn: Callable, *args) -> None:
+        """Run a potentially-blocking action in the thread pool; deliver result when done."""
+        lang = self._language
+        worker = _Runnable(fn, *args)
+        worker.signals.finished.connect(self._deliver_response)
+        worker.signals.error.connect(
+            lambda e: self._deliver_response(
+                f"Error: {e}" if lang == "en" else f"Hata: {e}"
+            )
+        )
+        self._pool.start(worker)
+
     def _execute_action(self, result: RouteResult, original_text: str) -> None:
+        self._si_route = result.action   # captured for self-improvement recording
         lang = self._language
 
         if result.action == "stop":
@@ -624,7 +888,7 @@ class NyraWindow(QMainWindow):
         elif result.action == "night_task":
             desc = result.params.get("description", "")
             if self._night_agent:
-                self._night_agent.schedule(desc)
+                self._night_agent.schedule(desc, language=lang)
                 if lang == "tr":
                     response = "Görev kuyruğa alındı, efendim. Tamamlanınca bildirim göndereceğim."
                 else:
@@ -658,7 +922,8 @@ class NyraWindow(QMainWindow):
         elif result.action == "resume":
             response = self.memory.resume_summary(lang)
         elif result.action == "show_recent":
-            response = recent_files(lang)
+            self._run_slow_action(recent_files, lang)
+            return
         elif result.action == "switch_mode":
             response = result.response or f"Switching to {result.params.get('mode', '')} mode."
         elif result.action == "volume_up":
@@ -685,6 +950,80 @@ class NyraWindow(QMainWindow):
             response = system_lock(lang)
         elif result.action == "system_sleep":
             response = system_sleep(lang)
+        elif result.action == "system_wake":
+            response = system_wake(lang)
+        elif result.action == "system_info":
+            self._run_slow_action(system_info, lang)
+            return
+        elif result.action == "take_screenshot":
+            self._run_slow_action(take_screenshot, lang)
+            return
+        elif result.action == "clipboard_read":
+            self._run_slow_action(clipboard_read, lang)
+            return
+        elif result.action == "clipboard_write":
+            response = clipboard_write(result.params.get("text", ""), lang)
+        elif result.action == "type_text":
+            response = type_text(result.params.get("text", ""), lang)
+        elif result.action == "send_hotkey":
+            response = send_hotkey(result.params.get("combo", ""), lang)
+        elif result.action == "open_folder":
+            response = open_folder(result.params.get("name", ""), lang)
+        elif result.action == "file_find":
+            self._run_slow_action(file_find, result.params.get("name", ""), lang)
+            return
+        elif result.action == "network_info":
+            self._run_slow_action(network_info, lang)
+            return
+        elif result.action == "process_list":
+            self._run_slow_action(process_list, lang)
+            return
+        elif result.action == "brightness_set":
+            response = brightness_set(result.params.get("level", 50), lang)
+        elif result.action == "steam_update":
+            response = steam_update_games(lang)
+        elif result.action == "install_app":
+            response = install_app(result.params.get("app", ""), lang)
+        elif result.action == "research_task":
+            desc = result.params.get("description", text)
+            if self._night_agent:
+                self._night_agent.schedule(desc, language=lang)
+                response = (
+                    f"Research queued, sir. I'll notify you when the report is ready."
+                    if lang == "en"
+                    else f"Araştırma kuyruğa alındı, efendim. Rapor hazır olduğunda bildiririm."
+                )
+            else:
+                response = "Background agent unavailable."
+        elif result.action == "price_task":
+            desc = result.params.get("description", text)
+            if self._night_agent:
+                self._night_agent.schedule(desc, language=lang)
+                response = (
+                    "Price check queued, sir. I'll have results shortly."
+                    if lang == "en"
+                    else "Fiyat araştırması kuyruğa alındı, efendim."
+                )
+            else:
+                response = "Background agent unavailable."
+        elif result.action == "world_news":
+            # Fetch in background — browser opens instantly, summary comes after
+            loading = (
+                "Opening Conflictly and fetching today's briefing, sir."
+                if lang == "en"
+                else "Conflictly açılıyor, günün özeti hazırlanıyor, efendim."
+            )
+            self._set_response(loading)
+            self._set_state("thinking", "Fetching")
+            worker = _Runnable(fetch_world_news, lang)
+            worker.signals.finished.connect(
+                lambda result: self._deliver_response(result[0])
+            )
+            worker.signals.error.connect(
+                lambda _: self._deliver_response(loading)
+            )
+            self._pool.start(worker)
+            return
         else:
             self._run_llm(original_text)
             return
@@ -723,10 +1062,17 @@ class NyraWindow(QMainWindow):
         self._deliver_response(resp)
 
     def _run_llm(self, text: str) -> None:
-        thinking_msg = "Düşünüyorum..." if self._language == "tr" else "Thinking..."
-        self._set_response(thinking_msg)
+        self._stream_buf = ""
+        self._stream_dots = 0
+        self._stream_first_sent = ""
+        self._stream_first_payload = None
+        self._set_response("· · ·")
+        mode = _detect_mode(text)
+        self._set_state("thinking", _mode_status(mode, self._language))
+        self._dots_timer = QTimer(self)
+        self._dots_timer.timeout.connect(self._animate_dots)
+        self._dots_timer.start(420)
         app_ctx = self._current_screen.process_name
-        # Inject behavior context so LLM knows user's habits
         behavior_ctx = self._behavior.context_for_llm()
         long_mem = self._long_memory
         self._llm_thread = LLMThread(self._agent, text, self._language, app_ctx, long_mem, behavior_ctx)
@@ -734,11 +1080,20 @@ class NyraWindow(QMainWindow):
         self._llm_thread.done.connect(self._on_llm_done)
         self._llm_thread.error.connect(self._on_llm_error)
         self._llm_thread.start()
-        # Timeout: if Ollama hangs, recover after 45s
+        # RESEARCH can take 120s (6 tool calls × up to 10s each + LLM calls)
+        # Other modes get 30s — fail fast so the user isn't left waiting
+        from mode_detector import Mode
+        timeout_ms = 120_000 if mode == Mode.RESEARCH else 30_000
         self._llm_timer = QTimer(self)
         self._llm_timer.setSingleShot(True)
         self._llm_timer.timeout.connect(self._on_llm_timeout)
-        self._llm_timer.start(45_000)
+        self._llm_timer.start(timeout_ms)
+
+    def _animate_dots(self) -> None:
+        self._stream_dots = (self._stream_dots + 1) % 4
+        dots = "· " * self._stream_dots or "·"
+        if not self._stream_buf:
+            self.response_label.setText(dots)
 
     def _on_llm_timeout(self) -> None:
         if hasattr(self, "_llm_thread") and self._llm_thread.isRunning():
@@ -747,15 +1102,48 @@ class NyraWindow(QMainWindow):
             self._set_response(msg)
             self._finish_turn()
 
-    def _on_llm_token(self, _token: str) -> None:
-        pass  # streaming tokens not displayed in orb-only mode
+    def _on_llm_token(self, token: str) -> None:
+        if hasattr(self, "_dots_timer"):
+            self._dots_timer.stop()
+        buf = getattr(self, "_stream_buf", "") + token
+        self._stream_buf = buf
+        self.response_label.setText(buf[:480])
+
+        # Pre-warm TTS: start synthesizing first sentence while LLM is still generating.
+        # By the time _deliver_response fires, the audio file is already on disk.
+        if not self._stream_first_sent and APP_CONFIG.voice_enabled:
+            sent = self._extract_first_sentence(buf)
+            if sent:
+                self._stream_first_sent = sent
+                lang = self._language
+                threading.Thread(
+                    target=self._prewarm_sentence,
+                    args=(sent, lang),
+                    daemon=True,
+                ).start()
+
+    def _extract_first_sentence(self, text: str) -> str:
+        """Return the first sentence from streaming text once it's complete."""
+        import re as _re
+        m = _re.search(r"[A-Za-zÀ-ÿ0-9\$€][^.!?]{6,}[.!?](?:\s|$)", text)
+        return m.group(0).strip() if m else ""
+
+    def _prewarm_sentence(self, sentence: str, language: str) -> None:
+        """Synthesize first sentence in background while LLM is generating."""
+        cleaned = _clean_for_tts(sentence)
+        if cleaned:
+            self._stream_first_payload = self.tts.prepare(cleaned, language)
 
     def _cancel_llm_timer(self) -> None:
         if hasattr(self, "_llm_timer"):
             self._llm_timer.stop()
+        if hasattr(self, "_dots_timer"):
+            self._dots_timer.stop()
 
     def _on_llm_done(self, response: str) -> None:
         self._cancel_llm_timer()
+        self._stream_buf = ""
+        self._si_route = "llm"   # mark LLM path for self-improvement
         clean_text, actions = parse_llm_actions(response)
         final_text = clean_text or response
 
@@ -766,7 +1154,11 @@ class NyraWindow(QMainWindow):
                 launch_app(app_name, self._language)
                 launched.append(action)
                 if self._life_log:
-                    self._life_log.log_app_opened(app_name)
+                    worker = _Runnable(self._life_log.log_app_opened, app_name)
+                    self._pool.start(worker)
+            elif action.action == "close_app":
+                close_app(action.params.get("app", ""), self._language)
+                launched.append(action)
             elif action.action == "open_web":
                 open_web(action.params.get("url", ""), self._language)
                 launched.append(action)
@@ -797,13 +1189,46 @@ class NyraWindow(QMainWindow):
         self._finish_turn()
 
     def _deliver_response(self, text: str) -> None:
+        # Record interaction for self-improvement (every completed turn)
+        if self._si_raw:
+            mode = _detect_mode(self._si_raw)
+            self._improve.record(
+                raw_text=self._si_raw,
+                language=self._language,
+                route=self._si_route or "unknown",
+                action_detail=mode.value,
+                response_text=text,
+            )
+            self._si_raw = ""
+            self._si_route = ""
+
         self._set_response(text)
         if APP_CONFIG.voice_enabled and not self._speech_paused:
             self._set_state("speaking", "Speaking")
             self._start_bargein_monitor()
-            self.tts.speak(text, self._language)
+            cleaned = _clean_for_tts(text)
+            self._speak_with_prewarm(cleaned)
         else:
             self._finish_turn()
+
+    def _speak_with_prewarm(self, cleaned: str) -> None:
+        """Use pre-warmed first sentence if ready; otherwise fall back to tts.speak()."""
+        first_sent_raw = getattr(self, "_stream_first_sent", "")
+        first_payload = getattr(self, "_stream_first_payload", None)
+        self._stream_first_sent = ""
+        self._stream_first_payload = None
+
+        if first_payload and first_sent_raw:
+            cleaned_first = _clean_for_tts(first_sent_raw)
+            if cleaned.startswith(cleaned_first):
+                rest = cleaned[len(cleaned_first):].strip()
+                self.tts._stopping = False
+                self.tts._sentence_language = self._language
+                self.tts._sentence_queue = self.tts._split_sentences(rest) if rest else []
+                self.tts._next_sentence_ready.emit(first_payload)
+                return
+
+        self.tts.speak(cleaned, self._language)
 
     def _start_bargein_monitor(self) -> None:
         self._bargein_stop = threading.Event()
@@ -826,6 +1251,7 @@ class NyraWindow(QMainWindow):
 
     def _on_tts_done(self) -> None:
         self._stop_bargein_monitor()
+        self._set_state("idle", "Listening")
         QTimer.singleShot(80, self._queue_voice_capture)
 
     def _finish_turn(self) -> None:
@@ -843,12 +1269,19 @@ class NyraWindow(QMainWindow):
     def _set_state(self, orb_state: str, status_text: str) -> None:
         self.status_label.setText(status_text)
         self.orb.set_state(orb_state)
+        col = _STATE_STATUS_COLOR.get(orb_state, "#3A5270")
+        self.status_label.setStyleSheet(
+            f"color: {col}; font-family: 'Cascadia Code', monospace; "
+            f"font-size: 9px; letter-spacing: 0.8px; padding: 3px 10px; "
+            f"background: rgba(255,255,255,0.025); "
+            f"border: 1px solid {col}44; border-radius: 5px;"
+        )
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
 
     def _set_response(self, text: str) -> None:
-        self.response_label.setText(text[:320])
+        self.response_label.setText(text[:480])
 
     # ── Screen & stats ────────────────────────────────────────────────────────
 
@@ -865,12 +1298,21 @@ class NyraWindow(QMainWindow):
         try:
             cpu = psutil.cpu_percent(interval=None)
             ram = psutil.virtual_memory().percent
+
+            parts: list[str] = []
             if _NVML_OK:
                 mem = _nvml.nvmlDeviceGetMemoryInfo(_GPU_HANDLE)
                 vram = mem.used / mem.total * 100
-                self._sys_label.setText(f"CPU {cpu:.0f}%  RAM {ram:.0f}%  VRAM {vram:.0f}%")
+                parts = [f"CPU {cpu:.0f}%", f"RAM {ram:.0f}%", f"VRAM {vram:.0f}%"]
             else:
-                self._sys_label.setText(f"CPU {cpu:.0f}%  RAM {ram:.0f}%")
+                parts = [f"CPU {cpu:.0f}%", f"RAM {ram:.0f}%"]
+
+            if self._night_agent:
+                summary = self._night_agent.status_summary(self._language)
+                if "running" in summary or "çalışıyor" in summary:
+                    parts.append("⬤ BG")
+
+            self._sys_label.setText("  ".join(parts))
         except Exception:
             pass
 
@@ -928,74 +1370,131 @@ class NyraWindow(QMainWindow):
     def _apply_styles(self) -> None:
         self.setStyleSheet("""
 * { outline: none; }
+
 QWidget {
-    color: #B8C5D6;
+    color: #A8BFCF;
     font-family: 'Segoe UI Variable', 'Segoe UI', system-ui;
     font-size: 12px;
     background: transparent;
 }
+
 #Shell {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #060810, stop:0.5 #080912, stop:1 #060810);
-    border: 1px solid rgba(255,255,255,0.05);
-    border-radius: 16px;
+    background: qlineargradient(x1:0, y1:0, x2:0.6, y2:1,
+        stop:0 #030509,
+        stop:0.4 #05070E,
+        stop:1   #030508);
+    border: 1px solid rgba(255,255,255,0.055);
+    border-radius: 18px;
 }
+
 #TopBar {
-    background: rgba(6, 8, 16, 0.95);
-    border: 1px solid rgba(255,255,255,0.05);
-    border-radius: 10px;
+    background: rgba(4, 6, 12, 0.96);
+    border: 1px solid rgba(255,255,255,0.045);
+    border-radius: 11px;
 }
+
 #BrandLabel {
-    font-size: 19px; font-weight: 700; color: #E0E8F4; letter-spacing: 0.4px;
+    font-size: 18px;
+    font-weight: 700;
+    color: #D4E2F2;
+    letter-spacing: 0.6px;
 }
+
 #StatusChip {
-    color: #4A5E78;
-    font-family: 'Cascadia Code', monospace;
-    font-size: 10px;
-    letter-spacing: 0.4px;
-    padding: 2px 8px;
-    background: rgba(255,255,255,0.03);
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 9px;
+    letter-spacing: 0.8px;
+    padding: 3px 10px;
+    background: rgba(255,255,255,0.025);
     border: 1px solid rgba(255,255,255,0.04);
     border-radius: 5px;
 }
+
 #ClockLabel {
-    color: #3A4E66; font-family: 'Cascadia Code', monospace; font-size: 12px; font-weight: 600;
+    color: #2E4560;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
 }
+
 #SysLabel {
-    color: #2A3B52; font-family: 'Cascadia Code', monospace; font-size: 9px;
+    color: #1E3048;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 8px;
+    letter-spacing: 0.3px;
 }
+
 #WinBtn {
     padding: 3px 10px;
-    background: rgba(255,255,255,0.02);
-    border: 1px solid rgba(255,255,255,0.04);
+    background: rgba(255,255,255,0.018);
+    border: 1px solid rgba(255,255,255,0.035);
     border-radius: 5px;
-    color: #2D3B52;
+    color: #253545;
     font-size: 13px;
-    min-width: 26px;
+    min-width: 24px;
 }
-#WinBtn:hover { background: rgba(255,255,255,0.07); color: #7090A8; }
+#WinBtn:hover {
+    background: rgba(255,255,255,0.065);
+    color: #6A96B8;
+    border-color: rgba(255,255,255,0.08);
+}
+
 #ResponseBar {
-    background: rgba(5, 7, 14, 0.60);
-    border: 1px solid rgba(255,255,255,0.04);
-    border-radius: 10px;
-    min-height: 48px;
-    max-height: 120px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(8,12,24,0.75),
+        stop:1 rgba(4,7,16,0.90));
+    border: 1px solid rgba(255,255,255,0.042);
+    border-top: 1px solid rgba(255,255,255,0.065);
+    border-radius: 12px;
+    min-height: 70px;
+    max-height: 160px;
 }
+
+#ResponseScroll {
+    background: transparent;
+    border: none;
+}
+
 #ResponseLabel {
-    color: #7A9AAB;
-    font-size: 12px;
-    line-height: 1.6;
+    color: #8AACBE;
+    font-size: 13px;
+    line-height: 1.7;
+    padding: 4px 2px;
+    background: transparent;
+    qproperty-alignment: AlignCenter;
 }
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 4px;
+    margin: 4px 2px;
+}
+QScrollBar::handle:vertical {
+    background: rgba(255,255,255,0.08);
+    border-radius: 2px;
+    min-height: 20px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+
 QMenu {
-    background: #080C14;
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 9px;
-    padding: 4px;
-    color: #B8C5D6;
+    background: #060A14;
+    border: 1px solid rgba(255,255,255,0.075);
+    border-radius: 10px;
+    padding: 5px;
+    color: #A8BFCF;
+    font-size: 12px;
 }
-QMenu::item { padding: 7px 16px; border-radius: 5px; }
-QMenu::item:selected { background: rgba(99,102,241,0.15); color: #A5B4FC; }
-QMenu::separator { background: rgba(255,255,255,0.05); height: 1px; margin: 4px 8px; }
+QMenu::item { padding: 8px 18px; border-radius: 6px; }
+QMenu::item:selected {
+    background: rgba(80,110,200,0.18);
+    color: #90B4E8;
+}
+QMenu::separator {
+    background: rgba(255,255,255,0.05);
+    height: 1px;
+    margin: 4px 10px;
+}
         """)
 
     # ── Window events ─────────────────────────────────────────────────────────

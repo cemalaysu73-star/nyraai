@@ -29,11 +29,14 @@ class TranscriptResult:
 
 
 _INITIAL_PROMPT = (
-    "Nyra AI assistant. User speaks English or Turkish. "
-    "Common phrases: open steam, install spotify, close window, volume up, "
-    "help me with my code, what is, tell me about, search for, "
-    "spotify aç, discord başlat, sesi aç, pencereyi kapat, ne yapayım, "
-    "nasılsın, teşekkürler, tamam, anlıyorum."
+    "Nyra AI assistant. Commands in English or Turkish. "
+    "English: open chrome, open steam, open spotify, open discord, open brave, open vlc, "
+    "search for, google, look up, play on youtube, install, download, close, volume up, "
+    "volume down, mute, next track, pause music, lock screen, what is, tell me about. "
+    "Turkish: chrome aç, steam aç, spotify aç, discord aç, ara, google'la, youtube'da oynat, "
+    "indir, kur, kapat, sesi aç, sesi kıs, sessiz yap, sonraki şarkı, müziği durdur, "
+    "ekranı kilitle, ne söyle, anlat, hatırla. "
+    "Names: Nyra, Aria, Valorant, Discord, Spotify, GitHub, Netflix, Reddit, Twitch."
 )
 
 
@@ -80,22 +83,22 @@ class STT:
         if len(audio) < self._MIN_SAMPLES:
             return TranscriptResult("", APP_CONFIG.default_language, 0.0)
 
+        beam = getattr(APP_CONFIG, "whisper_beam_size", 1)
         with self._lock:
             segments, info = self._model.transcribe(
                 audio,
-                beam_size=5,
-                best_of=5,
-                # Try 0.0 first; if output looks wrong Whisper retries at 0.2
-                temperature=[0.0, 0.2],
+                beam_size=beam,
+                best_of=beam,           # match beam — no wasted passes
+                temperature=0.0,        # single-pass, no retry temperature
                 vad_filter=True,
                 vad_parameters={
-                    "min_silence_duration_ms": 300,
-                    "speech_pad_ms": 200,   # more padding → fewer clipped words
-                    "threshold": 0.30,      # lower → catches quiet speech
+                    "min_silence_duration_ms": 150,
+                    "speech_pad_ms": 60,
+                    "threshold": 0.25,
                 },
                 without_timestamps=True,
                 condition_on_previous_text=False,
-                no_speech_threshold=0.45,   # default 0.6 skips too much quiet speech
+                no_speech_threshold=0.50,
                 initial_prompt=_INITIAL_PROMPT,
             )
             text = " ".join(s.text for s in segments).strip()

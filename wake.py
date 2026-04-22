@@ -16,7 +16,7 @@ from config import APP_CONFIG
 try:
     from vosk import KaldiRecognizer, Model as VoskModel
     _VOSK_OK = True
-except ImportError:
+except Exception:  # ImportError or FileNotFoundError (DLL missing in packaged build)
     KaldiRecognizer = None
     VoskModel = None
     _VOSK_OK = False

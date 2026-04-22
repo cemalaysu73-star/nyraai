@@ -114,7 +114,12 @@ def download_file(url: str, dest: str = "") -> str:
 
 # ── Shell ────────────────────────────────────────────────────────────────────
 
-def run_command(cmd: str, timeout: int = 60) -> str:
+def run_command(cmd: str, timeout: int = 30) -> str:
+    cmd_stripped = cmd.strip().lower()
+    # Fire-and-forget for launch/open commands — never block the UI
+    if cmd_stripped.startswith("start ") or cmd_stripped.startswith("steam://"):
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "Launched."
     try:
         result = subprocess.run(
             cmd, shell=True, capture_output=True,
