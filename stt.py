@@ -29,15 +29,24 @@ class TranscriptResult:
 
 
 _INITIAL_PROMPT = (
-    "Nyra AI assistant. Commands in English or Turkish. "
-    "English: open chrome, open steam, open spotify, open discord, open brave, open vlc, "
-    "search for, google, look up, play on youtube, install, download, close, volume up, "
-    "volume down, mute, next track, pause music, lock screen, what is, tell me about. "
-    "Turkish: chrome aç, steam aç, spotify aç, discord aç, ara, google'la, youtube'da oynat, "
-    "indir, kur, kapat, sesi aç, sesi kıs, sessiz yap, sonraki şarkı, müziği durdur, "
-    "ekranı kilitle, ne söyle, anlat, hatırla. "
-    "Names: Nyra, Aria, Valorant, Discord, Spotify, GitHub, Netflix, Reddit, Twitch."
+    "Nyra. Hey Nyra. Nyra AI assistant. Wake word is Nyra. "
+    "Commands in English or Turkish. "
+    "English: Nyra open chrome, Nyra open steam, Nyra open spotify, Nyra open discord, "
+    "Nyra search for, Nyra google, Nyra volume up, Nyra volume down, Nyra mute, "
+    "Nyra next track, Nyra pause music, Nyra lock screen, Nyra what is, Nyra tell me about. "
+    "Turkish: Nyra chrome aç, Nyra steam aç, Nyra spotify aç, Nyra ara, Nyra sesi aç, "
+    "Nyra sesi kıs, Nyra sessiz yap, Nyra ekranı kilitle, Nyra anlat, Nyra hatırla. "
+    "Names: Nyra, Valorant, Discord, Spotify, GitHub, Netflix, Reddit, Twitch."
 )
+
+# Common Whisper hallucinations on short/quiet audio — treat as empty
+_HALLUCINATIONS = frozenset({
+    "thank you", "thank you.", "thanks", "thanks.", "you", "you.",
+    "bye", "bye.", "goodbye", "goodbye.", "yes", "yes.", "no", "no.",
+    "okay", "okay.", "ok", "ok.", "music", "music.", "silence",
+    "uh", "um", "hmm", "hm", "ah", "oh",
+    "teşekkürler", "teşekkür ederim", "tamam", "evet", "hayır",
+})
 
 
 class STT:
@@ -76,8 +85,8 @@ class STT:
                 return self._do_transcribe(audio, language_hint)
             raise
 
-    # Minimum audio to bother transcribing (~0.4s at 16kHz)
-    _MIN_SAMPLES = 6_400
+    # Minimum audio to bother transcribing (~0.8s at 16kHz) — below this Whisper hallucinates
+    _MIN_SAMPLES = 12_800
 
     def _do_transcribe(self, audio, language_hint: str | None = None) -> TranscriptResult:
         if len(audio) < self._MIN_SAMPLES:
@@ -99,12 +108,21 @@ class STT:
                 },
                 without_timestamps=True,
                 condition_on_previous_text=False,
-                no_speech_threshold=0.50,
+                no_speech_threshold=0.30,
                 initial_prompt=_INITIAL_PROMPT,
             )
             text = " ".join(s.text for s in segments).strip()
         language = (language_hint or getattr(info, "language", None) or APP_CONFIG.default_language)
         confidence = float(getattr(info, "language_probability", 0.85))
+        # Discard known hallucinations and repeated-word patterns (e.g. "ПАП ПАП ПАП")
+        stripped = text.lower().strip(" .!?,")
+        words = stripped.split()
+        is_repeated = len(words) >= 3 and len(set(words)) == 1
+        # Unexpected language with short text = hallucination (e.g. Russian on a Turkish speaker)
+        detected_lang = language_hint or getattr(info, "language", "en")
+        is_wrong_lang = detected_lang not in ("en", "tr") and len(words) <= 6
+        if stripped in _HALLUCINATIONS or is_repeated or is_wrong_lang:
+            text = ""
         return TranscriptResult(text, language, confidence)
 
     def _reload_cpu(self) -> None:
