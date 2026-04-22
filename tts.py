@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import tempfile
@@ -28,6 +29,30 @@ from config import APP_CONFIG
 class SpeechPayload:
     kind: str   # "edge" | "fallback"
     value: str  # file path for "edge", raw text for "fallback"
+
+
+# ── In-memory audio cache — short phrases synthesized once, played instantly ──
+
+_AUDIO_CACHE: dict[str, bytes] = {}
+_AUDIO_CACHE_LOCK = threading.Lock()
+_AUDIO_CACHE_MAX = 120   # max entries (each ~15-60 KB)
+
+
+def _cache_key(text: str, language: str) -> str:
+    return hashlib.md5(f"{text}:{language}".encode()).hexdigest()
+
+
+def _cache_get(key: str) -> bytes | None:
+    with _AUDIO_CACHE_LOCK:
+        return _AUDIO_CACHE.get(key)
+
+
+def _cache_put(key: str, data: bytes) -> None:
+    with _AUDIO_CACHE_LOCK:
+        if len(_AUDIO_CACHE) >= _AUDIO_CACHE_MAX:
+            # evict oldest entry
+            _AUDIO_CACHE.pop(next(iter(_AUDIO_CACHE)))
+        _AUDIO_CACHE[key] = data
 
 
 class TTSManager(QObject):
@@ -60,10 +85,20 @@ class TTSManager(QObject):
         self._next_sentence_ready.connect(self._on_next_ready)
         self._playback_complete.connect(self._advance_or_finish)
 
+        # Pre-synthesized next sentence (sentence, payload) pair
+        self._presynth_lock = threading.Lock()
+        self._presynth_next: tuple[str, SpeechPayload | None] | None = None
+
+        # Persistent asyncio event loop — avoids create/destroy overhead per sentence
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=self._async_loop.run_forever, daemon=True, name="tts-async"
+        )
+        self._async_thread.start()
+
         # Pre-warm SAPI engine in background so first speak() is instant
         self._sapi_lock = threading.Lock()
         self._sapi_engine = None
-        self._sapi_rate = 190
         threading.Thread(target=self._warm_sapi, daemon=True).start()
 
     def _warm_sapi(self) -> None:
@@ -75,7 +110,7 @@ class TTSManager(QObject):
         try:
             engine = pyttsx3.init()
             self._configure_fallback(engine)
-            engine.setProperty("rate", self._sapi_rate)
+            engine.setProperty("rate", 190)
             engine.setProperty("volume", 1.0)
             with self._sapi_lock:
                 self._sapi_engine = engine
@@ -89,7 +124,6 @@ class TTSManager(QObject):
     # ── Public API ────────────────────────────────────────────────────────────
 
     def speak(self, text: str, language: str) -> None:
-        """Split text into sentences and play sequentially via edge-tts (neural quality)."""
         self.stop()
         self._stopping = False
         self._sentence_language = language
@@ -99,35 +133,11 @@ class TTSManager(QObject):
             return
         self._sentence_queue = sentences[1:]
 
-        first = sentences[0]
-        # Always prefer edge-tts (neural quality); SAPI is last-resort fallback only.
         threading.Thread(
             target=self._prepare_and_signal,
-            args=(first,),
+            args=(sentences[0],),
             daemon=True,
         ).start()
-
-    def _sapi_speak_fast(self, text: str) -> None:
-        """Speak a short sentence immediately via pre-warmed SAPI — no network, no temp file."""
-        if self._stopping:
-            return
-        self._playing = True
-        try:
-            with self._sapi_lock:
-                engine = self._sapi_engine
-                if engine is None:
-                    raise RuntimeError("SAPI not ready")
-                engine.say(text)
-                engine.runAndWait()
-        except Exception:
-            # SAPI failed — fall back to edge-tts
-            payload = self.prepare(text, self._sentence_language)
-            if not self._stopping:
-                self._next_sentence_ready.emit(payload)
-            return
-        self._playing = False
-        if not self._stopping:
-            self._playback_complete.emit()
 
     def prepare(self, text: str, language: str = "en") -> SpeechPayload | None:
         if not APP_CONFIG.voice_enabled or not text.strip():
@@ -140,9 +150,8 @@ class TTSManager(QObject):
         try:
             path = self._piper_audio(text, language)
             return SpeechPayload("edge", path)
-        except Exception as exc:
-            print(f"[TTS] piper failed: {exc}")
-        print("[TTS] falling back to pyttsx3")
+        except Exception:
+            pass
         return SpeechPayload("fallback", text)
 
     def play_prepared(self, payload: SpeechPayload | None) -> None:
@@ -170,6 +179,8 @@ class TTSManager(QObject):
     def stop(self) -> None:
         self._stopping = True
         self._sentence_queue.clear()
+        with self._presynth_lock:
+            self._presynth_next = None
         if self.player.playbackState() != QMediaPlayer.StoppedState:
             self.player.stop()
         engine = self._fallback_engine
@@ -192,8 +203,26 @@ class TTSManager(QObject):
             self._next_sentence_ready.emit(payload)
 
     def _on_next_ready(self, payload: object) -> None:
+        if self._stopping:
+            return
+        self.play_prepared(payload)
+        # While this sentence plays, pre-synthesize the next one
+        if self._sentence_queue:
+            next_sent = self._sentence_queue[0]
+            threading.Thread(
+                target=self._do_presynth,
+                args=(next_sent,),
+                daemon=True,
+            ).start()
+
+    def _do_presynth(self, sentence: str) -> None:
+        """Synthesize sentence N+1 while sentence N is playing."""
+        if self._stopping:
+            return
+        payload = self.prepare(sentence, self._sentence_language)
         if not self._stopping:
-            self.play_prepared(payload)
+            with self._presynth_lock:
+                self._presynth_next = (sentence, payload)
 
     def _advance_or_finish(self) -> None:
         if self._stopping:
@@ -202,11 +231,21 @@ class TTSManager(QObject):
             self.finished.emit()
             return
         sentence = self._sentence_queue.pop(0)
-        threading.Thread(
-            target=self._prepare_and_signal,
-            args=(sentence,),
-            daemon=True,
-        ).start()
+
+        # Use pre-synthesized payload if it matches the next sentence
+        with self._presynth_lock:
+            presynth = self._presynth_next
+            self._presynth_next = None
+
+        if presynth is not None and presynth[0] == sentence:
+            # Zero-gap: payload already ready
+            self._next_sentence_ready.emit(presynth[1])
+        else:
+            threading.Thread(
+                target=self._prepare_and_signal,
+                args=(sentence,),
+                daemon=True,
+            ).start()
 
     @staticmethod
     def _split_sentences(text: str) -> list[str]:
@@ -273,20 +312,43 @@ class TTSManager(QObject):
 
         threading.Thread(target=run, daemon=True).start()
 
+    # ── Audio synthesis — persistent loop + cache ─────────────────────────────
+
     def _edge_audio(self, text: str, language: str) -> str:
         voice, rate, pitch = self._voice_profile(language)
         cleaned = self._clean_for_tts(text)
+
+        # Cache lookup — short phrases are cached indefinitely
+        cache_key = _cache_key(cleaned[:200], language)
+        cached_bytes = _cache_get(cache_key)
+        if cached_bytes:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fh:
+                fh.write(cached_bytes)
+                return fh.name
+
+        # Synthesize via persistent asyncio loop (no loop create/destroy overhead)
+        future = asyncio.run_coroutine_threadsafe(
+            self._async_synthesize(cleaned, voice, rate, pitch),
+            self._async_loop,
+        )
+        path = future.result(timeout=20)
+
+        # Cache short phrases (<= 200 chars) as bytes
+        if len(cleaned) <= 200:
+            try:
+                data = Path(path).read_bytes()
+                if data:
+                    _cache_put(cache_key, data)
+            except Exception:
+                pass
+
+        return path
+
+    async def _async_synthesize(self, text: str, voice: str, rate: str, pitch: str) -> str:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fh:
             path = Path(fh.name)
-        communicate = Communicate(text=cleaned, voice=voice, rate=rate, pitch=pitch)
-        loop = asyncio.new_event_loop()
-        # Python 3.12+: threads have no default event loop — must set explicitly
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(communicate.save(str(path)))
-        finally:
-            asyncio.set_event_loop(None)
-            loop.close()
+        communicate = Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+        await communicate.save(str(path))
         if not path.exists() or path.stat().st_size < 100:
             path.unlink(missing_ok=True)
             raise RuntimeError("edge-tts returned empty audio")
@@ -315,11 +377,9 @@ class TTSManager(QObject):
 
     @staticmethod
     def _resolve_piper_model(model: str) -> str:
-        """Accept full path or bare model name. Searches default Piper data dirs."""
         p = Path(model)
         if p.is_file():
             return str(p)
-        # bare name — search common install locations
         search_dirs = [
             Path.home() / "AppData" / "Local" / "piper",
             Path.home() / ".local" / "share" / "piper",

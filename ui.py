@@ -89,17 +89,18 @@ class VoiceInputThread(QThread):
     transcribed = Signal(str, str)   # text, language
     failed = Signal()
 
-    def __init__(self, stt: STT, stop_event: threading.Event) -> None:
+    def __init__(self, stt: STT, stop_event: threading.Event, language_hint: str = "") -> None:
         super().__init__()
         self._stt = stt
         self._stop_event = stop_event
+        self._language_hint = language_hint or None
 
     def run(self) -> None:
         raw = capture_command(stop_event=self._stop_event)
         if not raw or self._stop_event.is_set():
             self.failed.emit()
             return
-        result = self._stt.transcribe(raw)
+        result = self._stt.transcribe(raw, language_hint=self._language_hint)
         if result.valid:
             self.transcribed.emit(result.text, result.language)
         else:
@@ -777,7 +778,7 @@ class NyraWindow(QMainWindow):
         self._voice_inflight = True
         self._set_state("listening", "Listening")
         self._capture_stop = threading.Event()
-        self._voice_thread = VoiceInputThread(self.stt, self._capture_stop)
+        self._voice_thread = VoiceInputThread(self.stt, self._capture_stop, self._language)
         self._voice_thread.transcribed.connect(self._on_transcribed)
         self._voice_thread.failed.connect(self._on_voice_failed)
         self._voice_thread.start()
@@ -795,7 +796,7 @@ class NyraWindow(QMainWindow):
         self._bargein_mode = False
 
         if not bargein and not any(w in lower for w in _WAKE_VARIANTS):
-            QTimer.singleShot(100, self._queue_voice_capture)
+            self._queue_voice_capture()
             return
 
         command = lower
@@ -1252,12 +1253,12 @@ class NyraWindow(QMainWindow):
     def _on_tts_done(self) -> None:
         self._stop_bargein_monitor()
         self._set_state("idle", "Listening")
-        QTimer.singleShot(80, self._queue_voice_capture)
+        QTimer.singleShot(50, self._queue_voice_capture)
 
     def _finish_turn(self) -> None:
         self._voice_inflight = False
         self._set_state("idle", "Listening")
-        QTimer.singleShot(300, self._queue_voice_capture)
+        QTimer.singleShot(80, self._queue_voice_capture)
 
     def _pause_speech(self) -> None:
         self._speech_paused = True

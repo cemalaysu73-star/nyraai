@@ -16,7 +16,7 @@ class Config:
 
     # ── Audio ──────────────────────────────────────────────────────────
     sample_rate: int = 16_000
-    blocksize: int = 2_048          # smaller = faster VAD response
+    blocksize: int = 1_024          # smaller = faster VAD response
     rms_floor: float = 0.0028
     peak_floor: float = 0.028
 
@@ -31,7 +31,7 @@ class Config:
 
     # ── STT ────────────────────────────────────────────────────────────
     whisper_model_size: str = "small"       # small: ~3% WER vs base's ~5% — better accuracy, similar speed on GPU
-    whisper_compute_type: str = "float16"
+    whisper_compute_type: str = "int8_float16"
     whisper_threads: int = 4
     whisper_beam_size: int = 1              # beam=1: fastest; increase to 3 for more accuracy
 

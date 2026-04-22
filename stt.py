@@ -56,7 +56,7 @@ class STT:
     def available(self) -> bool:
         return _WHISPER_OK
 
-    def transcribe(self, raw_pcm: bytes) -> TranscriptResult:
+    def transcribe(self, raw_pcm: bytes, language_hint: str | None = None) -> TranscriptResult:
         self._await_ready()
         if self._model is None:
             return TranscriptResult("", APP_CONFIG.default_language, 0.0)
@@ -66,20 +66,20 @@ class STT:
             return TranscriptResult("", APP_CONFIG.default_language, 0.0)
 
         try:
-            return self._do_transcribe(audio)
+            return self._do_transcribe(audio, language_hint)
         except RuntimeError as exc:
             # cuBLAS / CUDA DLL missing — model loaded but can't run; fall back to CPU
             if any(k in str(exc).lower() for k in ("dll", "cuda", "cublas", "cudnn")):
                 self._reload_cpu()
                 if self._model is None:
                     return TranscriptResult("", APP_CONFIG.default_language, 0.0)
-                return self._do_transcribe(audio)
+                return self._do_transcribe(audio, language_hint)
             raise
 
     # Minimum audio to bother transcribing (~0.4s at 16kHz)
     _MIN_SAMPLES = 6_400
 
-    def _do_transcribe(self, audio) -> TranscriptResult:
+    def _do_transcribe(self, audio, language_hint: str | None = None) -> TranscriptResult:
         if len(audio) < self._MIN_SAMPLES:
             return TranscriptResult("", APP_CONFIG.default_language, 0.0)
 
@@ -87,9 +87,10 @@ class STT:
         with self._lock:
             segments, info = self._model.transcribe(
                 audio,
+                language=language_hint,         # skip 20-50ms autodetect when hint provided
                 beam_size=beam,
-                best_of=beam,           # match beam — no wasted passes
-                temperature=0.0,        # single-pass, no retry temperature
+                best_of=beam,
+                temperature=0.0,
                 vad_filter=True,
                 vad_parameters={
                     "min_silence_duration_ms": 150,
@@ -102,7 +103,7 @@ class STT:
                 initial_prompt=_INITIAL_PROMPT,
             )
             text = " ".join(s.text for s in segments).strip()
-        language = getattr(info, "language", None) or APP_CONFIG.default_language
+        language = (language_hint or getattr(info, "language", None) or APP_CONFIG.default_language)
         confidence = float(getattr(info, "language_probability", 0.85))
         return TranscriptResult(text, language, confidence)
 

@@ -117,7 +117,7 @@ def capture_command(
                 if stop_event and stop_event.is_set():
                     break
                 try:
-                    chunk = audio_q.get(timeout=0.15)
+                    chunk = audio_q.get(timeout=0.05)
                 except queue.Empty:
                     if heard_speech and time.time() - last_voice > silence_limit:
                         break
