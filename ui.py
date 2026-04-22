@@ -1502,7 +1502,21 @@ QMenu::separator {
 
     def show_and_greet(self) -> None:
         self.reveal()
-        QTimer.singleShot(120, self._maybe_greet)
+        if not self.stt.ready:
+            self._set_state("thinking", "Loading AI model…")
+            self._poll_stt_ready()
+        else:
+            QTimer.singleShot(120, self._maybe_greet)
+
+    def _poll_stt_ready(self) -> None:
+        if self.stt.ready:
+            self._set_state("idle", "Listening")
+            QTimer.singleShot(120, self._maybe_greet)
+        elif "error" in self.stt.status:
+            self._set_state("idle", "Listening")
+            QTimer.singleShot(120, self._maybe_greet)
+        else:
+            QTimer.singleShot(1000, self._poll_stt_ready)
 
     def _toggle_visibility(self) -> None:
         if self.isVisible():

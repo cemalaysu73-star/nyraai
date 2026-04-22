@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent
+# In a PyInstaller frozen build, __file__ points to a temp _MEIPASS directory.
+# Use sys.executable (the .exe path) so that data/ lives next to the installed exe.
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).parent
+
 DATA_DIR = BASE_DIR / "data"
 
 
