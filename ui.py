@@ -538,6 +538,7 @@ _WAKE_VARIANTS = (
 
 class NyraWindow(QMainWindow):
     _wake_signal = Signal(str)
+    _stream_tts_ready = Signal()
 
     def __init__(
         self,
@@ -602,6 +603,7 @@ class NyraWindow(QMainWindow):
         self.tts.finished.connect(self._on_tts_done)
         self.tts.error.connect(lambda _: self._finish_turn())
         self._wake_signal.connect(self._on_wake)
+        self._stream_tts_ready.connect(self._on_stream_tts_ready)
 
         self._start_services()
 
@@ -1130,10 +1132,26 @@ class NyraWindow(QMainWindow):
         return m.group(0).strip() if m else ""
 
     def _prewarm_sentence(self, sentence: str, language: str) -> None:
-        """Synthesize first sentence in background while LLM is generating."""
+        """Synthesize first sentence in background; emit signal to start playing immediately."""
         cleaned = _clean_for_tts(sentence)
         if cleaned:
             self._stream_first_payload = self.tts.prepare(cleaned, language)
+            self._stream_tts_ready.emit()
+
+    def _on_stream_tts_ready(self) -> None:
+        """Start playing first sentence as soon as it's synthesized — LLM may still be running."""
+        if self._stopping or self.tts.is_speaking:
+            return
+        payload = self._stream_first_payload
+        if payload is None:
+            return
+        self._stream_first_payload = None
+        self._set_state("speaking", "Speaking")
+        self._start_bargein_monitor()
+        self.tts._sentence_language = self._language
+        # Remaining sentences will be queued by _speak_with_prewarm when LLM finishes
+        self.tts._sentence_queue = []
+        self.tts.play_prepared(payload)
 
     def _cancel_llm_timer(self) -> None:
         if hasattr(self, "_llm_timer"):
@@ -1213,22 +1231,21 @@ class NyraWindow(QMainWindow):
             self._finish_turn()
 
     def _speak_with_prewarm(self, cleaned: str) -> None:
-        """Use pre-warmed first sentence if ready; otherwise fall back to tts.speak()."""
+        """Queue remaining sentences if TTS already started; otherwise speak full text."""
         first_sent_raw = getattr(self, "_stream_first_sent", "")
-        first_payload = getattr(self, "_stream_first_payload", None)
         self._stream_first_sent = ""
         self._stream_first_payload = None
 
-        if first_payload and first_sent_raw:
+        # If _on_stream_tts_ready already started playback, just queue the rest
+        if self.tts.is_speaking and first_sent_raw:
             cleaned_first = _clean_for_tts(first_sent_raw)
-            if cleaned.startswith(cleaned_first):
-                rest = cleaned[len(cleaned_first):].strip()
-                self.tts._stopping = False
-                self.tts._sentence_language = self._language
-                self.tts._sentence_queue = self.tts._split_sentences(rest) if rest else []
-                self.tts._next_sentence_ready.emit(first_payload)
-                return
+            rest = cleaned[len(cleaned_first):].strip() if cleaned.startswith(cleaned_first) else cleaned
+            if rest:
+                sentences = self.tts._split_sentences(rest)
+                self.tts._sentence_queue.extend(sentences)
+            return
 
+        # First sentence wasn't started yet — speak everything now
         self.tts.speak(cleaned, self._language)
 
     def _start_bargein_monitor(self) -> None:
