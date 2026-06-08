@@ -1,33 +1,4 @@
-from __future__ import annotations
 
-import os
-import shutil
-import subprocess
-import urllib.request
-from pathlib import Path
-
-import win32clipboard
-
-# ── Protected paths — never delete/overwrite these ───────────────────────────
-
-_PROTECTED = {
-    Path("C:/Windows"),
-    Path("C:/Program Files"),
-    Path("C:/Program Files (x86)"),
-    Path("C:/ProgramData"),
-    Path("C:/System Volume Information"),
-}
-
-
-def _is_protected(path: Path) -> bool:
-    p = path.resolve()
-    for protected in _PROTECTED:
-        try:
-            p.relative_to(protected.resolve())
-            return True
-        except ValueError:
-            pass
-    # Also protect drive roots (C:\, D:\, etc.)
     if len(p.parts) <= 1:
         return True
     return False
